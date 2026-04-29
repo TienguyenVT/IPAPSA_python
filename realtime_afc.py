@@ -16,6 +16,7 @@ import threading
 import sys
 import os
 import pystoi
+from scipy.signal import resample_poly, firwin2
 
 # Uu tien dung thu vien pesq chinh thuc (ITU-T P.862.2)
 # Cai dat: pip install pesq
@@ -44,7 +45,6 @@ def _fir_filter(x, b):
 
 def _resample(x, from_fs, to_fs):
     """Resample signal using linear interpolation."""
-    from scipy.signal import resample_poly
     if from_fs == to_fs:
         return x
     g = np.gcd(to_fs, from_fs)
@@ -80,7 +80,6 @@ def _compute_irs_filter(fs):
         length = 480
     else:
         return np.array([1.0])
-    from scipy.signal import firwin2
     b = firwin2(length, f, H, fs=fs)
     return b
 
@@ -425,6 +424,12 @@ class AdaptiveFilter:
         if algo not in self.ALGORITHMS:
             raise ValueError(f"Unknown algorithm: {algo}. Choose from: {list(self.ALGORITHMS.keys())}")
 
+        # APA-family data matrices (MAX_P must be set before p validation)
+        self.MAX_P = 10
+
+        if p > self.MAX_P:
+            raise ValueError(f"Projection order p={p} exceeds MAX_P={self.MAX_P}. Reduce p or recompile with larger MAX_P.")
+
         self.M = M
         # mu is algorithm-dependent; use AFCParameters defaults when step not specified
         if step is None:
@@ -447,7 +452,6 @@ class AdaptiveFilter:
         self.TDLLswh = np.zeros(M, dtype=np.float64)
 
         # APA-family data matrices
-        self.MAX_P = 10
         self.TDLMicwh = np.zeros(self.MAX_P, dtype=np.float64)
         self.TDLLswh_d = np.zeros(M + self.MAX_P - 1, dtype=np.float64)
         self.Lswh_ap = np.zeros((M, self.MAX_P), dtype=np.float64)
@@ -456,7 +460,6 @@ class AdaptiveFilter:
         self.Q_tilde_prev = np.zeros((M, self.MAX_P), dtype=np.float64)
 
         # AP approximation params
-        self.delta_IPAPA = 0.0
 
         # --- Algorithm Parameters (from MATLAB/Simulink) ---
         self.mu1 = mu1      # NLMS step when stable (sw2 mode): mu/2 = 4e-6
@@ -475,7 +478,6 @@ class AdaptiveFilter:
         self.d_fb = d_fb    # Feedback cancellation path delay (samples)
 
         # AR model (pre-whitening) — MATLAB: AR_ORDER=La=20, FRAMELENGTH=framelength=160
-        # BUG WAS: hardcoded 20 and 160, inconsistent with AFCParameters constants.
         self.AR_ORDER = _AFP.La           # = 20 samples (from AFCParameters)
         self.FRAMELENGTH = _AFP.framelength  # = 160 samples = 10ms at 16kHz
         self.max_ar = max_ar  # AR coefficient clamp limit (was 5.0, now 6)
@@ -489,7 +491,6 @@ class AdaptiveFilter:
         self.ls_delay_buf = np.zeros(self.FRAMELENGTH + 1, dtype=np.float64)
 
         self._lock = threading.Lock()
-        self._first_sample = True
 
     # ------------------------------------------------------------------
     # Core processing per sample
@@ -500,9 +501,6 @@ class AdaptiveFilter:
         Returns: (error, feedback_estimate)
         """
         with self._lock:
-            if self._first_sample:
-                self._first_sample = False
-
             # 1. Cập nhật TDLLs (reference signal delay line)
             self.TDLLs[1:] = self.TDLLs[:-1]
             self.TDLLs[0] = ref_sample
@@ -603,22 +601,21 @@ class AdaptiveFilter:
             # ------------------------------------------------------------------
             # 9. Thuật toán thích nghi
             # ------------------------------------------------------------------
-            eps_val = (1.0 - self.a) / (2.0 * self.M) * self.delta
+            norm_reg = (1.0 - self.a) / (2.0 * self.M) * self.delta
             denom_norm = 0.0
 
             if self.algo == 'nlms':
                 norm_sq = np.dot(self.TDLLswh, self.TDLLswh) + self.delta
                 u_pgs = self.TDLLswh * soft_sign(ep, self.lda)
                 denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (norm_sq + eps_val)
+                update = self.mu * u_pgs / (norm_sq + norm_reg)
 
             elif self.algo == 'ipnlms':
-                # BUG WAS: used self.delta in sparseness denominator — should be self.delta_sc
                 b = (1.0 - self.a) / (2.0 * self.M) + \
                     (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
                 u_pgs = b * self.TDLLswh * soft_sign(ep, self.lda)
                 denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + eps_val)
+                update = self.mu * u_pgs / (denom_norm + norm_reg)
 
             elif self.algo == 'apa':
                 AtA = Lswh_ap_active.T @ Lswh_ap_active
@@ -630,25 +627,22 @@ class AdaptiveFilter:
                 update = self.mu * update
 
             elif self.algo == 'ipapa':
-                # BUG WAS: used self.delta in sparseness denominator — should be self.delta_sc
                 b = (1.0 - self.a) / (2.0 * self.M) + \
                     (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
                 B = np.diag(b)
                 u_pgs = B @ Lswh_ap_active @ soft_sign(ewh_p, self.lda)
                 denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + eps_val)
+                update = self.mu * u_pgs / (denom_norm + norm_reg)
 
             elif self.algo == 'ipapsa':
-                # BUG WAS: used self.delta in sparseness denominator — should be self.delta_sc
                 b = (1.0 - self.a) / (2.0 * self.M) + \
                     (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
                 B = np.diag(b)
                 u_pgs = B @ Lswh_ap_active @ soft_sign(ewh_p, self.lda)
                 denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + eps_val)
+                update = self.mu * u_pgs / (denom_norm + norm_reg)
 
             elif self.algo == 'mipapsa':
-                # BUG WAS: used self.delta in sparseness denominator — should be self.delta_sc
                 b = (1.0 - self.a) / (2.0 * self.M) + \
                     (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
                 current_col = b * Lswh_ap_active[:, 0]
@@ -663,7 +657,7 @@ class AdaptiveFilter:
 
                 u_tilde_pgs = Q_tilde @ soft_sign(ewh_p, self.lda)
                 denom_norm = np.dot(u_tilde_pgs, u_tilde_pgs)
-                update = self.mu * u_tilde_pgs / (denom_norm + eps_val)
+                update = self.mu * u_tilde_pgs / (denom_norm + norm_reg)
 
                 if self.p >= 2:
                     self.Q_tilde_prev[:, 1:] = self.Q_tilde_prev[:, :-1]
@@ -701,15 +695,13 @@ class AdaptiveFilter:
 
                 u_hat_pgs = Q_hat @ soft_sign(ewh_p, self.lda)
                 denom_norm = np.dot(u_hat_pgs, u_hat_pgs)
-                update = self.mu * u_hat_pgs / (denom_norm + eps_val)
+                update = self.mu * u_hat_pgs / (denom_norm + norm_reg)
 
                 if self.p >= 2:
                     self.Q_tilde_prev[:, 1:] = self.Q_tilde_prev[:, :-1]
                     self.Q_tilde_prev[:, 0] = current_col
 
             # Leaky update: w(n+1) = (1 - leaky)*w(n) + update
-            # BUG WAS: "update += leaky*gTD" then "gTD += update"
-            #   → gTD_new = (1+leaky)*gTD + update_pure  (amplifies norm — WRONG)
             # Leaky LMS must DECAY the weight vector to prevent blow-up.
             if self.leaky > 0:
                 self.gTD = (1.0 - self.leaky) * self.gTD + update
@@ -717,12 +709,10 @@ class AdaptiveFilter:
                 # Apply update
                 self.gTD = self.gTD + update
 
-            # NOTE: DC removal tren gTD da bi VO HIEU HOA.
-            # Ly do: mean(gTD) ~ 0.039/step >> adaptive update ~ 9e-5/step
-            # → DC removal keo trong so ve 0 nhanh hon thuat toan co the hoc,
-            #   khien W_norm giam nhung RMS tang (filter diverging, khong phai converging).
-            # Acoustic feedback path thuc te co DC component → khong duoc xoa.
-            # self.gTD = self.gTD - np.mean(self.gTD)  # DISABLED
+            # DC removal on gTD is DISABLED. Reason: mean(gTD) ~ 0.039/step
+            # while adaptive update ~ 9e-5/step → DC removal kills weights faster than
+            # the algorithm can learn, causing W_norm to drop while RMS rises (diverging).
+            # The acoustic feedback path has a real DC component that should not be removed.
 
             # Guard NaN in weights
             for j in range(self.M):
@@ -771,7 +761,6 @@ class AdaptiveFilter:
             self.ar_delay_ls.fill(0.0)
             self.mic_delay_buf.fill(0.0)
             self.ls_delay_buf.fill(0.0)
-            self._first_sample = True
 
     def switch_mu(self, stable):
         """Switch between mu1 (stable) and mu2 (unstable) for HNLMS recovery.
@@ -831,7 +820,6 @@ class AFCManager:
         # Hearing-aid amplification gain K (default 30 dB from AFCParameters)
         # out = K * (mic - feedback_estimate) = K * error
         self.output_gain = 1.0   # will be set externally via manager.output_gain = K
-        self._smooth_error = 0.0
         self._smooth_alpha = 0.1
         self._clipped_ratio = 0.0
 
@@ -848,7 +836,6 @@ class AFCManager:
         self._ramp_start_time = None
         self._ramp_done = False
         self._ramp_factor = 0.0
-        self._ramp_chunk_count = 0
 
         # Stability detection for mu1/mu2 switching (HNLMS recovery)
         # Uses error RMS relative to a slowly-tracked "expected" level.
@@ -880,7 +867,6 @@ class AFCManager:
         self._stoi_win_sec = stoi_win_sec
         self._stoi_last_compute = 0.0
         self._current_stoi = 0.0
-        self._stoi_count = 0
 
         # PESQ buffers (longer window: ~4s)
         self._pesq_buffer_len = int(pesq_win_sec * sample_rate)
@@ -942,8 +928,7 @@ class AFCManager:
             stoi_val = pystoi.stoi(clean_seg, proc_seg, self.sample_rate, extended=False)
         except Exception:
             stoi_val = 0.0
-        n_frames = int(buf_len / self.sample_rate / 0.016)
-        return float(stoi_val), n_frames
+        return float(stoi_val)
 
     def _push_pesq(self, clean_sample, processed_sample):
         """Append sample to circular PESQ buffers."""
@@ -972,10 +957,17 @@ class AFCManager:
             if _PESQ_OFFICIAL:
                 # ITU-T P.862.2 wideband (16kHz) hoac narrowband (8kHz)
                 mode = 'wb' if self.sample_rate == 16000 else 'nb'
-                pesq_val = float(_pesq_official(self.sample_rate,
-                                                clean_seg.astype(np.float32),
-                                                proc_seg.astype(np.float32),
-                                                mode))
+                pesq_result = _pesq_official(self.sample_rate,
+                                            clean_seg.astype(np.float32),
+                                            proc_seg.astype(np.float32),
+                                            mode)
+                # pesq library returns PesqResult(nb_peaq_score, ...) or PesqResult(pesq, N_del)
+                # Extract the score regardless of result type (namedtuple, tuple, or float)
+                try:
+                    pesq_val = float(getattr(pesq_result, 'pesq',
+                                           pesq_result[0] if hasattr(pesq_result, '__getitem__') else pesq_result))
+                except Exception:
+                    pesq_val = float(pesq_result)
             else:
                 pesq_val = compute_pesq(clean_seg, proc_seg, self.sample_rate)
         except Exception:
@@ -1000,7 +992,6 @@ class AFCManager:
         self._ramp_start_time = None
         self._ramp_done = False
         self._ramp_factor = 0.0
-        self._ramp_chunk_count = 0
 
     def _apply_startup_ramp(self, now):
         """Apply startup ramp: gain ramps from 0 to target over _ramp_duration_sec.
@@ -1021,8 +1012,6 @@ class AFCManager:
             self._ramp_factor = 1.0
         else:
             self._ramp_factor = elapsed / self._ramp_duration_sec
-
-        self._ramp_chunk_count += 1
 
     def run_full_duplex(self, mic_idx, spk_idx, ref_idx=None):
         self.mode = self.MODE_FULL_DUPLEX
@@ -1202,28 +1191,71 @@ class AFCManager:
                     smooth_e = (1 - self._smooth_alpha) * smooth_e + self._smooth_alpha * chunk_rms
 
                     if now - self._stoi_last_compute >= self._stoi_win_sec:
-                        self._current_stoi, _ = self._compute_stoi()
+                        self._current_stoi = self._compute_stoi()
                         self._stoi_last_compute = now
 
                     if now - self._pesq_last_compute >= self._pesq_win_sec:
                         self._current_pesq, self._current_snrseg, self._current_lsd = self._compute_pesq()
                         self._pesq_last_compute = now
 
+                    # Build display values with type safety + debug for tuple sources
+                    # Always safe-convert first, then debug types
+                    def _safe(v, default=0.0):
+                        try: return float(v) if not isinstance(v, tuple) else default
+                        except: return default
+                    def _safe_int(v, default=0):
+                        try: return int(v) if not isinstance(v, tuple) else default
+                        except: return default
+
+                    _t = type(sample_count).__name__
+                    if _t == 'tuple':
+                        sys.stderr.write(f"DEBUG: sample_count is tuple: {sample_count}\n")
+                    _t2 = type(smooth_e).__name__
+                    if _t2 == 'tuple':
+                        sys.stderr.write(f"DEBUG: smooth_e is tuple: {smooth_e}\n")
+                    _t3 = type(s['w_norm']).__name__
+                    if _t3 == 'tuple':
+                        sys.stderr.write(f"DEBUG: w_norm is tuple: {s['w_norm']}\n")
+                    _t4 = type(clipped).__name__
+                    if _t4 == 'tuple':
+                        sys.stderr.write(f"DEBUG: clipped is tuple: {clipped}\n")
+                    _t5 = type(self._clipped_ratio).__name__
+                    if _t5 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _clipped_ratio is tuple: {self._clipped_ratio}\n")
+                    _t6 = type(self.output_gain).__name__
+                    if _t6 == 'tuple':
+                        sys.stderr.write(f"DEBUG: output_gain is tuple: {self.output_gain}\n")
+                    _t7 = type(self._current_stoi).__name__
+                    if _t7 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_stoi is tuple: {self._current_stoi}\n")
+                    _t8 = type(self._current_pesq).__name__
+                    if _t8 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_pesq is tuple: {self._current_pesq}\n")
+
+                    disp_sample_count = _safe_int(sample_count)
+                    disp_smooth_e = _safe(smooth_e)
+                    disp_w_norm = _safe(s['w_norm'])
+                    disp_clipped = _safe_int(clipped)
+                    disp_clipped_ratio = _safe(self._clipped_ratio)
+                    disp_gain_db = _safe(20.0*np.log10(self.output_gain+1e-12))
+                    disp_stoi = _safe(self._current_stoi)
+                    disp_pesq = _safe(self._current_pesq)
+                    disp_ramp_pct = int(self._ramp_factor * 100)
+                    disp_ramp_str = f"RAMP:{disp_ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
                     wmax_str = 'inf' if self.afc.w_max_norm == float('inf') else f'{self.afc.w_max_norm:.1f}'
                     sw_str = 'mu1' if self._stable else 'mu2'
-                    ramp_pct = int(self._ramp_factor * 100)
-                    ramp_str = f"RAMP:{ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
+
                     self._print(
                         f"  [{time.strftime('%H:%M:%S')}] "
-                        f"Samples: {sample_count:>10,} | "
-                        f"RMS: {smooth_e:.5f} | "
-                        f"W norm: {s['w_norm']:.4f}/{wmax_str} | "
-                        f"Pre-clip: {clipped}/{self.chunk_size} ({self._clipped_ratio*100:.0f}%) | "
-                        f"K: {20.0*np.log10(self.output_gain+1e-12):.1f}dB | "
+                        f"Samples: {disp_sample_count:>10,} | "
+                        f"RMS: {disp_smooth_e:.5f} | "
+                        f"W norm: {disp_w_norm:.4f}/{wmax_str} | "
+                        f"Pre-clip: {disp_clipped}/{self.chunk_size} ({disp_clipped_ratio*100:.0f}%) | "
+                        f"K: {disp_gain_db:.1f}dB | "
                         f"SW: {sw_str} | "
-                        f"{ramp_str} | "
-                        f"STOI: {self._current_stoi:.3f} | "
-                        f"PESQ: {self._current_pesq:.2f}",
+                        f"{disp_ramp_str} | "
+                        f"STOI: {disp_stoi:.3f} | "
+                        f"PESQ: {disp_pesq:.2f}",
                         end='\r'
                     )
                     last_print = now
@@ -1365,10 +1397,10 @@ class AFCManager:
 
                 sample_count += self.chunk_size
 
-                # STOI/PESQ: clean = loop_chunk (reference), processed = out_chunk
+                # STOI/PESQ: clean = mic (user's speech), processed = output (user hears)
                 for i in range(self.chunk_size):
-                    self._push_stoi(float(loop_chunk[i]), float(out_chunk[i]))
-                    self._push_pesq(float(loop_chunk[i]), float(out_chunk[i]))
+                    self._push_stoi(float(mic_chunk[i]), float(out_chunk[i]))
+                    self._push_pesq(float(mic_chunk[i]), float(out_chunk[i]))
 
                 now = time.time()
                 if now - last_print >= 2.0:
@@ -1376,30 +1408,79 @@ class AFCManager:
                     smooth_e = (1 - self._smooth_alpha) * smooth_e + self._smooth_alpha * chunk_rms
 
                     if now - self._stoi_last_compute >= self._stoi_win_sec:
-                        self._current_stoi, _ = self._compute_stoi()
+                        self._current_stoi = self._compute_stoi()
                         self._stoi_last_compute = now
 
                     if now - self._pesq_last_compute >= self._pesq_win_sec:
                         self._current_pesq, self._current_snrseg, self._current_lsd = self._compute_pesq()
                         self._pesq_last_compute = now
 
+                    def _safe(v, default=0.0):
+                        try: return float(v) if not isinstance(v, tuple) else default
+                        except: return default
+                    def _safe_int(v, default=0):
+                        try: return int(v) if not isinstance(v, tuple) else default
+                        except: return default
+
+                    _t = type(sample_count).__name__
+                    if _t == 'tuple':
+                        sys.stderr.write(f"DEBUG: sample_count is tuple: {sample_count}\n")
+                    _t2 = type(smooth_e).__name__
+                    if _t2 == 'tuple':
+                        sys.stderr.write(f"DEBUG: smooth_e is tuple: {smooth_e}\n")
+                    _t3 = type(s['w_norm']).__name__
+                    if _t3 == 'tuple':
+                        sys.stderr.write(f"DEBUG: w_norm is tuple: {s['w_norm']}\n")
+                    _t4 = type(clipped).__name__
+                    if _t4 == 'tuple':
+                        sys.stderr.write(f"DEBUG: clipped is tuple: {clipped}\n")
+                    _t5 = type(self._clipped_ratio).__name__
+                    if _t5 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _clipped_ratio is tuple: {self._clipped_ratio}\n")
+                    _t6 = type(self.output_gain).__name__
+                    if _t6 == 'tuple':
+                        sys.stderr.write(f"DEBUG: output_gain is tuple: {self.output_gain}\n")
+                    _t7 = type(self._current_stoi).__name__
+                    if _t7 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_stoi is tuple: {self._current_stoi}\n")
+                    _t8 = type(self._current_pesq).__name__
+                    if _t8 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_pesq is tuple: {self._current_pesq}\n")
+                    _t9 = type(self._current_snrseg).__name__
+                    if _t9 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_snrseg is tuple: {self._current_snrseg}\n")
+                    _t10 = type(self._current_lsd).__name__
+                    if _t10 == 'tuple':
+                        sys.stderr.write(f"DEBUG: _current_lsd is tuple: {self._current_lsd}\n")
+
+                    disp_sample_count = _safe_int(sample_count)
+                    disp_smooth_e = _safe(smooth_e)
+                    disp_w_norm = _safe(s['w_norm'])
+                    disp_clipped = _safe_int(clipped)
+                    disp_clipped_ratio = _safe(self._clipped_ratio)
+                    disp_gain_db = _safe(20.0*np.log10(self.output_gain+1e-12))
+                    disp_stoi = _safe(self._current_stoi)
+                    disp_pesq = _safe(self._current_pesq)
+                    disp_snrseg = _safe(self._current_snrseg)
+                    disp_lsd = _safe(self._current_lsd)
+                    disp_ramp_pct = int(self._ramp_factor * 100)
+                    disp_ramp_str = f"RAMP:{disp_ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
                     wmax_str = 'inf' if self.afc.w_max_norm == float('inf') else f'{self.afc.w_max_norm:.1f}'
                     sw_str = 'mu1' if self._stable else 'mu2'
-                    ramp_pct = int(self._ramp_factor * 100)
-                    ramp_str = f"RAMP:{ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
+
                     self._print(
                         f"  [{time.strftime('%H:%M:%S')}] "
-                        f"Samples: {sample_count:>10,} | "
-                        f"RMS: {smooth_e:.5f} | "
-                        f"W norm: {s['w_norm']:.4f}/{wmax_str} | "
-                        f"Pre-clip: {clipped}/{self.chunk_size} ({self._clipped_ratio*100:.0f}%) | "
-                        f"K: {20.0*np.log10(self.output_gain+1e-12):.1f}dB | "
+                        f"Samples: {disp_sample_count:>10,} | "
+                        f"RMS: {disp_smooth_e:.5f} | "
+                        f"W norm: {disp_w_norm:.4f}/{wmax_str} | "
+                        f"Pre-clip: {disp_clipped}/{self.chunk_size} ({disp_clipped_ratio*100:.0f}%) | "
+                        f"K: {disp_gain_db:.1f}dB | "
                         f"SW: {sw_str} | "
-                        f"{ramp_str} | "
-                        f"STOI: {self._current_stoi:.3f} | "
-                        f"PESQ: {self._current_pesq:.2f} | "
-                        f"SNRseg: {self._current_snrseg:.1f}dB | "
-                        f"LSD: {self._current_lsd:.2f}dB",
+                        f"{disp_ramp_str} | "
+                        f"STOI: {disp_stoi:.3f} | "
+                        f"PESQ: {disp_pesq:.2f} | "
+                        f"SNRseg: {disp_snrseg:.1f}dB | "
+                        f"LSD: {disp_lsd:.2f}dB",
                         end='\r'
                     )
                     last_print = now
@@ -1435,17 +1516,14 @@ def check_dependencies():
         sys.exit(1)
 
 
-def auto_tune(sample_rate, mode='monitor', algo='nlms'):
+def auto_tune(sample_rate, algo='nlms'):
     """Tu dong chon thong so toi uu theo MATLAB/Simulink reference.
 
     For AFC at 16 kHz: M=64, p=2, delta=1e-6, a=0.5.
-    mu is algorithm-dependent (now used correctly):
+    mu is algorithm-dependent:
       - nlms/ipnlms  : 1e-3
       - apa/ipapa    : 9e-4
       - ipapsa family: 8e-6
-
-    BUG WAS: algo_defaults dict was defined but never read; function always returned
-    step=1e-3 regardless of algorithm. Fixed by adding algo parameter and using it.
     """
     from adaptfilt.afc_params import AFCParameters as _AFP
 
@@ -1460,20 +1538,11 @@ def auto_tune(sample_rate, mode='monitor', algo='nlms'):
     }
     step = algo_defaults.get(algo, _AFP.mu_nlms_ipnlms)
 
-    if mode == 'monitor':
-        if sample_rate <= 16000:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 256
-        elif sample_rate <= 44100:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 512
-        else:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 512
+    if sample_rate <= 16000:
+        chunk = 256
     else:
-        if sample_rate <= 16000:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 256
-        elif sample_rate <= 44100:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 512
-        else:
-            M, delta, a, p, chunk = 64, 1e-6, 0.5, 2, 512
+        chunk = 512
+    M, delta, a, p = 64, 1e-6, 0.5, 2
     return M, step, delta, a, p, chunk
 
 
@@ -1556,8 +1625,8 @@ def main():
                         help='Max weight norm (default: 20.0, tranh blow-up bo loc)')
     parser.add_argument('--leaky', type=float, default=None,
                         help='Leakage factor (default: 0.0)')
-    parser.add_argument('--gain', type=float, default=1.0,
-                        help='Linear gain (default: 1.0 = 0dB)')
+    parser.add_argument('--gain', type=float, default=None,
+                        help='Linear gain (default: 25 dB startup, 30 dB ceiling)')
     parser.add_argument('--db', type=float, default=30.0,
                         help='Amplification in dB (default: 30, MATLAB Kdb)')
     parser.add_argument('--auto', action='store_true',
@@ -1606,13 +1675,16 @@ def main():
     # Lý do: gain cao gây feedback loop ngay lập tức, filter chưa kịp học
     # 10dB đủ để nghe rõ trong khi filter thích nghi
     # Người dùng có thể override bằng --gain hoặc --db
-    _25DB = 10 ** (25.0 / 20.0)  # = 17.783
-    linear_gain = _25DB if args.gain == 1.0 else args.gain
+    # Startup default gain: 25 dB (gain starts below the 30 dB ceiling to give
+    # the AFC filter room to learn before reaching full amplification).
+    _DEFAULT_GAIN_DB = 25.0
+    _DEFAULT_LINEAR_GAIN = 10 ** (_DEFAULT_GAIN_DB / 20.0)  # ~17.78x
+    linear_gain = args.gain if args.gain is not None else _DEFAULT_LINEAR_GAIN
     db_gain = 20.0 * np.log10(linear_gain)
 
     # Auto-tune (base values — step will be overridden per-algo inside the loop below)
     if args.auto:
-        M, _step_auto, delta, a, p, chunk = auto_tune(args.sr, mode, algo=selected_algo)
+        M, _step_auto, delta, a, p, chunk = auto_tune(args.sr, algo=selected_algo)
         if args.M is not None:
             M = args.M
         if args.delta is not None:
@@ -1684,7 +1756,7 @@ def main():
         if args.step is not None:
             step = args.step
         elif args.auto:
-            _, step, _, _, _, _ = auto_tune(args.sr, mode, algo=algo_key)
+            _, step, _, _, _, _ = auto_tune(args.sr, algo=algo_key)
             if args.chunk is not None:
                 chunk = args.chunk
         else:
