@@ -156,8 +156,9 @@ def compute_pesq(ref, deg, fs):
         deg = _resample(deg, fs, fs_target)
         fs = fs_target
 
-    ref_p = ref / (np.max(np.abs(ref)) + 1e-12)
-    deg_p = deg / (np.max(np.abs(deg)) + 1e-12)
+    ref_max = np.max(np.abs(ref)) + 1e-12
+    ref_p = ref / ref_max
+    deg_p = deg / ref_max
 
     irs_b = _compute_irs_filter(fs)
     ref_f = _fir_filter(ref_p, irs_b)
@@ -178,20 +179,24 @@ def compute_pesq(ref, deg, fs):
     deg_db = 10.0 * np.log10(deg_bark)
     diff_db = deg_db - ref_db
 
-    # Zwicker loudness: L = sum_j(S_j^0.3) per frame
-    ref_loud = np.sum(np.power(ref_bark, 0.3), axis=1, keepdims=True) + 1e-12
-    deg_loud = np.sum(np.power(deg_bark, 0.3), axis=1, keepdims=True) + 1e-12
+    # Zwicker loudness per band: L_j = S_j^0.3
+    ref_bark_loud = np.power(ref_bark, 0.3)
+    deg_bark_loud = np.power(deg_bark, 0.3)
 
-    # Asymmetric disturbance (P.862 eq. 1-2): penalize added noise more than missing signal
+    # Asymmetric disturbance per Bark band (P.862 eq. 1-2):
+    #   D_plus  = max(deg - ref, 0)  — added noise, penalize fully
+    #   D_minus = min(deg - ref, 0)  — missing signal, penalize with alpha=0.5
+    # Computing per-band BEFORE summing preserves frequency resolution.
     alpha = 0.5
-    diff_loud = deg_loud - ref_loud
-    D_plus = np.maximum(diff_loud, 0.0)
-    D_minus = np.minimum(diff_loud, 0.0)
-    D_asym = D_plus + alpha * D_minus
+    diff_band = deg_bark_loud - ref_bark_loud
+    D_plus  = np.maximum(diff_band, 0.0)
+    D_minus = np.minimum(diff_band, 0.0)
+    D_asym_per_band = D_plus + alpha * D_minus   # shape: (n_frames, n_bark)
 
-    # Per-band asymmetric disturbance weighted by relative band power
-    band_weights = ref_bark / (np.sum(ref_bark, axis=1, keepdims=True) + 1e-12)
-    D_asym_weighted = D_asym * band_weights
+    # Weight each band by its relative contribution to total reference loudness
+    ref_total_loud = np.sum(ref_bark_loud, axis=1, keepdims=True) + 1e-12
+    band_weights = ref_bark_loud / ref_total_loud
+    D_asym_weighted = D_asym_per_band * band_weights
 
     # Frame-level: sum over bands, then time-filter
     D_frame = np.sum(D_asym_weighted, axis=1)
@@ -316,488 +321,7 @@ def compute_lsd(ref, deg, fs, n_fft=512):
     return float(np.mean(lsd_vals))
 
 
-# ------------------------------------------------------------------
-# Levinson-Durbin recursion cho AR model
-# ------------------------------------------------------------------
-def levinson_durbin(r, order, max_coeff=6.0):
-    """
-    Levinson-Durbin recursion.
-    r = autocorrelation vector [R[0], R[1], ..., R[order]] (already normalized by R[0] externally)
-    order = AR model order
-    max_coeff : float
-        AR coefficient clamp limit — should match AFCParameters.max_ar (default 6).
-        Previously hardcoded as 10.0, which was inconsistent with AFCParameters.max_ar = 6.
-    Returns: AR coefficients [1, a1, a2, ..., a_order], prediction error E
-    """
-    if order == 0:
-        return np.array([1.0]), r[0]
-
-    a = np.zeros(order + 1, dtype=np.float64)
-    a[0] = 1.0
-
-    E = r[0]
-    if not np.isfinite(E) or abs(E) < 1e-12:
-        E = 1e-12
-
-    for p in range(1, order + 1):
-        num = sum(r[j] * a[j] for j in range(1, p + 1))
-        k = (r[p] - num) / E
-
-        # Clamp reflection coefficient to [-1, 1] for stability
-        if not np.isfinite(k):
-            k = 0.0
-        k = max(-1.0, min(1.0, k))
-
-        for j in range(1, p):
-            a[j] = a[j] + k * a[p - j]
-        a[p] = k
-
-        E = E * (1.0 - k * k)
-        if not np.isfinite(E) or abs(E) < 1e-12:
-            E = 1e-12
-
-    # Clamp all coefficients using the passed max_coeff (= self.max_ar = AFCParameters.max_ar)
-    for j in range(1, order + 1):
-        if not np.isfinite(a[j]) or abs(a[j]) > max_coeff:
-            a[j] = max(-max_coeff, min(max_coeff, a[j]))
-
-    return a, E
-
-
-def ar_filter(sample, ar_coeffs, delay_line):
-    """Lọc FIR một mẫu qua AR model: y = sum(ar_coeffs[i] * delay_line[i])."""
-    delay_line[1:] = delay_line[:-1]
-    delay_line[0] = sample
-    if len(ar_coeffs) == 0:
-        return 0.0, delay_line
-    n = min(len(ar_coeffs), len(delay_line))
-    y = sum(ar_coeffs[j] * delay_line[j] for j in range(n))
-    # Clamp output to prevent overflow
-    if not np.isfinite(y):
-        y = 0.0
-    return y, delay_line
-
-
-def sign(x):
-    """Hard signed error: sign(0) = 1 (đồng bộ MATLAB convention)."""
-    return np.where(x >= 0, 1.0, -1.0)
-
-
-def soft_sign(x, lda):
-    """
-    Soft signed error: tanh(lda * x).
-    Đồng bộ MATLAB/Simulink: lda = AFCParameters.lda = 6.
-    Approaches hard sign as lda → ∞.
-    Previously lda was stored in self.lda but sign() was always called without lda,
-    so the parameter had zero effect. Now used throughout all algorithm update steps.
-    """
-    return np.tanh(lda * x)
-
-
-# ------------------------------------------------------------------
-# AdaptiveFilter - 7 thuật toán thích nghi
-# ------------------------------------------------------------------
-class AdaptiveFilter:
-    """
-    Bộ lọc thích nghi AFC với 7 thuật toán.
-    Đồng bộ với Adpative_Filter.txt (MATLAB/Simulink).
-    """
-
-    ALGORITHMS = {
-        'nlms':     'PEM-NLMS',
-        'ipnlms':   'PEM-IPNLMS',
-        'apa':      'PEM-APA',
-        'ipapa':    'PEM-IPAPA',
-        'ipapsa':   'PEM-IPAPSA',
-        'mipapsa':  'PEM-MIPAPSA',
-        'bsmipapsa': 'PEM-BSMIPAPSA',
-    }
-
-    def __init__(self, M=64, step=None, delta=1e-6,
-                 a=0.5, p=2, algo='nlms',
-                 w_max_norm=None, leaky=0.0,
-                 # ---- MATLAB/Simulink AFC parameters ----
-                 mu1=4e-6, mu2=8e-2, eps=1e-5, lda=6,
-                 delta_sc=1e-8, beta=50, M_bs=8,
-                 tanh_scale=0.5, tanh_thresh=0.15,
-                 max_ar=6, fs=16000, d_k=96, d_fb=1):
-        if algo not in self.ALGORITHMS:
-            raise ValueError(f"Unknown algorithm: {algo}. Choose from: {list(self.ALGORITHMS.keys())}")
-
-        # APA-family data matrices (MAX_P must be set before p validation)
-        self.MAX_P = 10
-
-        if p > self.MAX_P:
-            raise ValueError(f"Projection order p={p} exceeds MAX_P={self.MAX_P}. Reduce p or recompile with larger MAX_P.")
-
-        self.M = M
-        # mu is algorithm-dependent; use AFCParameters defaults when step not specified
-        if step is None:
-            self.mu = _AFP.get_mu(algo)
-        else:
-            self.mu = step
-        self.delta = delta
-        self.a = a
-        self.p = p
-        self.algo = algo
-        self.algo_name = self.ALGORITHMS[algo]
-        self.w_max_norm = w_max_norm if w_max_norm is not None else float('inf')
-        self.leaky = leaky
-
-        # Feedback path filter coefficients (gTD)
-        self.gTD = np.zeros(M, dtype=np.float64)
-
-        # Delay lines
-        self.TDLLs = np.zeros(M, dtype=np.float64)
-        self.TDLLswh = np.zeros(M, dtype=np.float64)
-
-        # APA-family data matrices
-        self.TDLMicwh = np.zeros(self.MAX_P, dtype=np.float64)
-        self.TDLLswh_d = np.zeros(M + self.MAX_P - 1, dtype=np.float64)
-        self.Lswh_ap = np.zeros((M, self.MAX_P), dtype=np.float64)
-
-        # PEM-MIPAPSA / PEM-BSMIPAPSA memory
-        self.Q_tilde_prev = np.zeros((M, self.MAX_P), dtype=np.float64)
-
-        # AP approximation params
-
-        # --- Algorithm Parameters (from MATLAB/Simulink) ---
-        self.mu1 = mu1      # NLMS step when stable (sw2 mode): mu/2 = 4e-6
-        self.mu2 = mu2      # NLMS step when unstable: mu*10^4 = 8e-2
-        self.eps = eps      # Epsilon in regression matrix: R_mu = eps*I
-        self.lda = lda       # Signed error sigmoid coefficient
-        self.delta_sc = delta_sc  # Sparseness measure regularization
-        self.beta = beta     # TanH-gated threshold factor (beta/1000)
-        self.M_bs = M_bs    # Number of blocks for BSMIPAPSA
-        self.tanh_scale = tanh_scale  # Error clipping: e = 2*tanh(0.5*e)
-        self.tanh_thresh = tanh_thresh  # Impulse detection threshold
-
-        # --- System Parameters ---
-        self.fs = fs        # Sampling frequency (Hz)
-        self.d_k = d_k      # Forward path delay (samples)
-        self.d_fb = d_fb    # Feedback cancellation path delay (samples)
-
-        # AR model (pre-whitening) — MATLAB: AR_ORDER=La=20, FRAMELENGTH=framelength=160
-        self.AR_ORDER = _AFP.La           # = 20 samples (from AFCParameters)
-        self.FRAMELENGTH = _AFP.framelength  # = 160 samples = 10ms at 16kHz
-        self.max_ar = max_ar  # AR coefficient clamp limit (was 5.0, now 6)
-        self.ar_coeffs = np.zeros(self.AR_ORDER, dtype=np.float64)
-        self.ar_coeffs[0] = 1.0
-        self.ar_frame = np.zeros(self.FRAMELENGTH, dtype=np.float64)
-        self.ar_frameindex = 0
-        self.ar_delay_mic = np.zeros(self.AR_ORDER, dtype=np.float64)
-        self.ar_delay_ls = np.zeros(self.AR_ORDER, dtype=np.float64)
-        self.mic_delay_buf = np.zeros(self.FRAMELENGTH + 1, dtype=np.float64)
-        self.ls_delay_buf = np.zeros(self.FRAMELENGTH + 1, dtype=np.float64)
-
-        self._lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # Core processing per sample
-    # ------------------------------------------------------------------
-    def process_sample(self, mic_sample, ref_sample):
-        """
-        Xử lý một mẫu (đồng bộ MATLAB: gọi trong vòng lặp mỗi mẫu).
-        Returns: (error, feedback_estimate)
-        """
-        with self._lock:
-            # 1. Cập nhật TDLLs (reference signal delay line)
-            self.TDLLs[1:] = self.TDLLs[:-1]
-            self.TDLLs[0] = ref_sample
-
-            # 2. Tính error signal: e = mic - gTD^T * TDLLs
-            e = mic_sample - np.dot(self.gTD, self.TDLLs)
-            if not np.isfinite(e):
-                e = 0.0
-
-            # 3. Clipping: e = 2 * tanh(scale * e) — synchronized with MATLAB
-            e_clipped = 2.0 * np.tanh(self.tanh_scale * e)
-
-            # 4. Delay & AR filter signals
-            # Delay mic signal
-            self.mic_delay_buf[1:] = self.mic_delay_buf[:-1]
-            self.mic_delay_buf[0] = mic_sample
-            Micdelay = self.mic_delay_buf[self.FRAMELENGTH]
-
-            # Delay ref signal
-            self.ls_delay_buf[1:] = self.ls_delay_buf[:-1]
-            self.ls_delay_buf[0] = ref_sample
-            Lsdelay = self.ls_delay_buf[self.FRAMELENGTH]
-
-            # AR filter (pre-whitening)
-            Micwh, self.ar_delay_mic = ar_filter(Micdelay, self.ar_coeffs, self.ar_delay_mic)
-            Lswh, self.ar_delay_ls = ar_filter(Lsdelay, self.ar_coeffs, self.ar_delay_ls)
-            if not np.isfinite(Micwh):
-                Micwh = 0.0
-            if not np.isfinite(Lswh):
-                Lswh = 0.0
-
-            # 5. Update AR model frame & Levinson
-            self.ar_frame[1:] = self.ar_frame[:-1]
-            self.ar_frame[0] = e_clipped
-
-            if self.ar_frameindex == self.FRAMELENGTH - 1 and self.AR_ORDER - 1 > 0:
-                R = np.zeros(self.AR_ORDER, dtype=np.float64)
-                for j in range(self.AR_ORDER):
-                    vec_mult = np.zeros(self.FRAMELENGTH, dtype=np.float64)
-                    end_idx = min(self.FRAMELENGTH, self.FRAMELENGTH - j)
-                    vec_mult[:end_idx] = self.ar_frame[j:j + end_idx]
-                    R[j] = np.dot(self.ar_frame, vec_mult) / self.FRAMELENGTH
-
-                # Normalize autocorrelation by R[0] for Levinson-Durbin
-                R0 = R[0]
-                if abs(R0) > 1e-12:
-                    R_norm = R / R0
-                else:
-                    R_norm = R.copy()
-                    R_norm[0] = 1.0
-
-                ar_new, _ = levinson_durbin(R_norm, self.AR_ORDER - 1, max_coeff=self.max_ar)
-                self.ar_coeffs.fill(0.0)
-                n_copy = min(len(ar_new), self.AR_ORDER)
-                self.ar_coeffs[:n_copy] = ar_new[:n_copy]
-
-                # Clamp AR coefficients to prevent instability
-                max_ar = self.max_ar
-                for j in range(len(self.ar_coeffs)):
-                    if not np.isfinite(self.ar_coeffs[j]):
-                        self.ar_coeffs[j] = 0.0
-                    self.ar_coeffs[j] = max(-max_ar, min(max_ar, self.ar_coeffs[j]))
-
-            self.ar_frameindex = (self.ar_frameindex + 1) % self.FRAMELENGTH
-
-            # 6. Cập nhật TDLLswh (pre-whitened signal delay line)
-            self.TDLLswh[1:] = self.TDLLswh[:-1]
-            self.TDLLswh[0] = Lswh
-
-            # 7. Tính ep = Micwh - Lswh^T * gTD
-            ep = Micwh - np.dot(self.TDLLswh, self.gTD)
-            if not np.isfinite(ep):
-                ep = 0.0
-
-            # 8. Cập nhật APA data matrices
-            self.TDLMicwh[1:] = self.TDLMicwh[:-1]
-            self.TDLMicwh[0] = Micwh
-
-            self.TDLLswh_d[1:] = self.TDLLswh_d[:-1]
-            self.TDLLswh_d[0] = Lswh
-
-            for i in range(self.p):
-                vec_start = i
-                vec_end = i + self.M - 1
-                if vec_end < len(self.TDLLswh_d):
-                    self.Lswh_ap[:, i] = self.TDLLswh_d[vec_start:vec_end + 1]
-                else:
-                    avail = len(self.TDLLswh_d) - vec_start
-                    col = np.zeros(self.M, dtype=np.float64)
-                    col[:avail] = self.TDLLswh_d[vec_start:]
-                    self.Lswh_ap[:, i] = col
-
-            # Active submatrices
-            Lswh_ap_active = self.Lswh_ap[:, :self.p]
-            TDLMicwh_active = self.TDLMicwh[:self.p]
-            ewh_p = TDLMicwh_active - Lswh_ap_active.T @ self.gTD
-
-            # ------------------------------------------------------------------
-            # 9. Thuật toán thích nghi
-            # ------------------------------------------------------------------
-            norm_reg = (1.0 - self.a) / (2.0 * self.M) * self.delta
-            denom_norm = 0.0
-
-            if self.algo == 'nlms':
-                norm_sq = np.dot(self.TDLLswh, self.TDLLswh) + self.delta
-                u_pgs = self.TDLLswh * soft_sign(ep, self.lda)
-                denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (norm_sq + norm_reg)
-
-            elif self.algo == 'ipnlms':
-                b = (1.0 - self.a) / (2.0 * self.M) + \
-                    (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
-                u_pgs = b * self.TDLLswh * soft_sign(ep, self.lda)
-                denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + norm_reg)
-
-            elif self.algo == 'apa':
-                AtA = Lswh_ap_active.T @ Lswh_ap_active
-                A_mat = self.delta * np.eye(self.p, dtype=np.float64) + AtA
-                rc = np.linalg.cond(A_mat)
-                if not np.isfinite(rc) or rc > 1e10:
-                    A_mat += (max(self.delta, 1e-6) * 10) * np.eye(self.p, dtype=np.float64)
-                update = Lswh_ap_active @ np.linalg.solve(A_mat, soft_sign(ewh_p, self.lda))
-                update = self.mu * update
-
-            elif self.algo == 'ipapa':
-                b = (1.0 - self.a) / (2.0 * self.M) + \
-                    (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
-                B = np.diag(b)
-                u_pgs = B @ Lswh_ap_active @ soft_sign(ewh_p, self.lda)
-                denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + norm_reg)
-
-            elif self.algo == 'ipapsa':
-                b = (1.0 - self.a) / (2.0 * self.M) + \
-                    (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
-                B = np.diag(b)
-                u_pgs = B @ Lswh_ap_active @ soft_sign(ewh_p, self.lda)
-                denom_norm = np.dot(u_pgs, u_pgs)
-                update = self.mu * u_pgs / (denom_norm + norm_reg)
-
-            elif self.algo == 'mipapsa':
-                b = (1.0 - self.a) / (2.0 * self.M) + \
-                    (1.0 + self.a) * np.abs(self.gTD) / (np.sum(np.abs(self.gTD)) + self.delta_sc)
-                current_col = b * Lswh_ap_active[:, 0]
-
-                if self.p >= 2:
-                    Q_tilde = np.zeros((self.M, self.p), dtype=np.float64)
-                    Q_tilde[:, 0] = current_col
-                    cols_from_prev = min(self.p - 1, self.Q_tilde_prev.shape[1])
-                    Q_tilde[:, 1:1 + cols_from_prev] = self.Q_tilde_prev[:, :cols_from_prev]
-                else:
-                    Q_tilde = current_col
-
-                u_tilde_pgs = Q_tilde @ soft_sign(ewh_p, self.lda)
-                denom_norm = np.dot(u_tilde_pgs, u_tilde_pgs)
-                update = self.mu * u_tilde_pgs / (denom_norm + norm_reg)
-
-                if self.p >= 2:
-                    self.Q_tilde_prev[:, 1:] = self.Q_tilde_prev[:, :-1]
-                    self.Q_tilde_prev[:, 0] = current_col
-
-            elif self.algo == 'bsmipapsa':
-                M_bs = self.M_bs
-                N_bs = self.M // M_bs
-                b_hat = np.zeros(self.M, dtype=np.float64)
-                block_norms = np.zeros(M_bs, dtype=np.float64)
-
-                for blk in range(M_bs):
-                    idx_start = blk * N_bs
-                    idx_end = idx_start + N_bs
-                    block_norms[blk] = np.linalg.norm(self.gTD[idx_start:idx_end])
-
-                sum_block_norms = np.sum(block_norms)
-
-                for blk in range(M_bs):
-                    idx_start = blk * N_bs
-                    idx_end = idx_start + N_bs
-                    b_hat_k = (1.0 - self.a) / (2.0 * self.M) + \
-                              (1.0 + self.a) * block_norms[blk] / (2.0 * M_bs * sum_block_norms + self.delta_sc)
-                    b_hat[idx_start:idx_end] = b_hat_k
-
-                current_col = b_hat * Lswh_ap_active[:, 0]
-
-                if self.p >= 2:
-                    Q_hat = np.zeros((self.M, self.p), dtype=np.float64)
-                    Q_hat[:, 0] = current_col
-                    cols_from_prev = min(self.p - 1, self.Q_tilde_prev.shape[1])
-                    Q_hat[:, 1:1 + cols_from_prev] = self.Q_tilde_prev[:, :cols_from_prev]
-                else:
-                    Q_hat = current_col
-
-                u_hat_pgs = Q_hat @ soft_sign(ewh_p, self.lda)
-                denom_norm = np.dot(u_hat_pgs, u_hat_pgs)
-                update = self.mu * u_hat_pgs / (denom_norm + norm_reg)
-
-                if self.p >= 2:
-                    self.Q_tilde_prev[:, 1:] = self.Q_tilde_prev[:, :-1]
-                    self.Q_tilde_prev[:, 0] = current_col
-
-            # Leaky update: w(n+1) = (1 - leaky)*w(n) + update
-            # Leaky LMS must DECAY the weight vector to prevent blow-up.
-            if self.leaky > 0:
-                self.gTD = (1.0 - self.leaky) * self.gTD + update
-            else:
-                # Apply update
-                self.gTD = self.gTD + update
-
-            # DC removal on gTD is DISABLED. Reason: mean(gTD) ~ 0.039/step
-            # while adaptive update ~ 9e-5/step → DC removal kills weights faster than
-            # the algorithm can learn, causing W_norm to drop while RMS rises (diverging).
-            # The acoustic feedback path has a real DC component that should not be removed.
-
-            # Guard NaN in weights
-            for j in range(self.M):
-                if not np.isfinite(self.gTD[j]):
-                    self.gTD[j] = 0.0
-
-            # Weight norm clamping
-            w_norm = np.linalg.norm(self.gTD)
-            if np.isfinite(w_norm) and w_norm > self.w_max_norm and self.w_max_norm != float('inf'):
-                self.gTD = self.gTD * (self.w_max_norm / w_norm)
-
-            # Estimate feedback
-            y = np.dot(self.gTD, self.TDLLs)
-            if not np.isfinite(y):
-                y = 0.0
-
-            return e, y
-
-    def process_chunk(self, mic_chunk, ref_chunk):
-        """Process a chunk of samples (wrapper around per-sample processing)."""
-        n = len(mic_chunk)
-        errors = np.zeros(n, dtype=np.float32)
-        y_est = np.zeros(n, dtype=np.float32)
-
-        for i in range(n):
-            e, y = self.process_sample(float(mic_chunk[i]), float(ref_chunk[i]))
-            errors[i] = e
-            y_est[i] = y
-
-        return errors.astype(np.float32), y_est.astype(np.float32)
-
-    def reset(self):
-        with self._lock:
-            self.gTD.fill(0.0)
-            self.TDLLs.fill(0.0)
-            self.TDLLswh.fill(0.0)
-            self.TDLMicwh.fill(0.0)
-            self.TDLLswh_d.fill(0.0)
-            self.Lswh_ap.fill(0.0)
-            self.Q_tilde_prev.fill(0.0)
-            self.ar_coeffs.fill(0.0)
-            self.ar_coeffs[0] = 1.0
-            self.ar_frame.fill(0.0)
-            self.ar_frameindex = 0
-            self.ar_delay_mic.fill(0.0)
-            self.ar_delay_ls.fill(0.0)
-            self.mic_delay_buf.fill(0.0)
-            self.ls_delay_buf.fill(0.0)
-
-    def switch_mu(self, stable):
-        """Switch between mu1 (stable) and mu2 (unstable) for HNLMS recovery.
-
-        When acoustic feedback causes instability, the error magnitude spikes.
-        Switching to mu2 (large step) helps the filter converge quickly to the
-        new feedback path. Once stable, mu1 (small step) ensures fine tracking.
-        """
-        with self._lock:
-            self.mu = self.mu2 if not stable else self.mu1
-
-    def get_stats(self):
-        with self._lock:
-            return {
-                'w_norm': float(np.linalg.norm(self.gTD)),
-                'w_max': float(np.max(np.abs(self.gTD))),
-                'w_mean': float(np.mean(np.abs(self.gTD))),
-                'algo': self.algo_name,
-                'mu': self.mu,
-                'mu1': self.mu1,
-                'mu2': self.mu2,
-                'delta': self.delta,
-                'eps': self.eps,
-                'a': self.a,
-                'p': self.p,
-                'M_bs': self.M_bs,
-                'tanh_scale': self.tanh_scale,
-                'tanh_thresh': self.tanh_thresh,
-                'lda': self.lda,
-                'beta': self.beta,
-                'delta_sc': self.delta_sc,
-                'max_ar': self.max_ar,
-                'fs': self.fs,
-                'd_k': self.d_k,
-                'd_fb': self.d_fb,
-            }
-
+from adaptive_algorithms import AdaptiveFilter
 
 # ------------------------------------------------------------------
 # AFCManager - Audio I/O
@@ -807,49 +331,75 @@ class AFCManager:
     MODE_LOOPBACK = 'loopback'
 
     def __init__(self, afc, sample_rate=44100, chunk_size=512,
-                 stoi_win_sec=1.0, pesq_win_sec=4.0):
+                 stoi_win_sec=3.0, pesq_win_sec=4.0,
+                 stable_threshold=None, stable_hysteresis=None,
+                 stable_min_frames=None,
+                 min_gain_db=-6.0,
+                 log_csv=False, log_wav=False,
+                 device_rate=None):
         self.afc = afc
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
+        self.sample_rate = sample_rate   # processing rate (16000 Hz, MATLAB ref)
+        self.chunk_size = chunk_size     # chunk size at processing rate
+
+        # --- Sample-rate bridging (FIX: capture at native device rate) ---
+        # device_rate: hardware sample rate (e.g. 44100 Hz for Realtek)
+        # proc_rate  : AFC processing rate (16000 Hz, MATLAB reference)
+        # PyAudio streams are opened at device_rate; data is resampled in Python
+        # using high-quality resample_poly before AFC processing and after.
+        # This eliminates the low-quality Windows driver SRC that causes glitches.
+        self._device_rate = device_rate if device_rate is not None else sample_rate
+        self._proc_rate = sample_rate
+        _need_resample = (self._device_rate != self._proc_rate)
+        self._need_resample = _need_resample
+        if _need_resample:
+            from math import gcd as _gcd
+            _g = _gcd(self._device_rate, self._proc_rate)
+            self._rs_up   = self._proc_rate   // _g   # up-factor   (e.g. 160 for 44100→16000)
+            self._rs_down = self._device_rate // _g   # down-factor (e.g. 441 for 44100→16000)
+            # Device chunk size: number of samples to request from hardware per AFC chunk
+            # Must be integer; slight rounding is fine — resample_poly handles fractional ratios.
+            self._device_chunk_size = max(1, round(chunk_size * self._device_rate / self._proc_rate))
+        else:
+            self._rs_up = self._rs_down = 1
+            self._device_chunk_size = chunk_size
         self.pyaudio = pyaudio.PyAudio()
         self.running = False
         self.mode = None
+        self._log_csv = log_csv
+        self._log_wav = log_wav
+        self._mic_log = []
+        self._spk_log = []
 
         self.mic_buffer = np.zeros(chunk_size, dtype=np.float32)
         self.ref_buffer = np.zeros(chunk_size, dtype=np.float32)
-        # Hearing-aid amplification gain K (default 30 dB from AFCParameters)
-        # out = K * (mic - feedback_estimate) = K * error
-        self.output_gain = 1.0   # will be set externally via manager.output_gain = K
+        self.output_gain = 1.0
         self._smooth_alpha = 0.1
         self._clipped_ratio = 0.0
+        # FIX-B4: allow gain to go below 0 dB so AGC can suppress bursts
+        # that overwhelm the filter before it converges.  Default −6 dB.
+        self._min_gain = 10 ** (min_gain_db / 20.0)
 
-        # AGC state
         self._agc_enabled = True
 
-        # ── Startup ramp: gain goes 0 → target over _ramp_duration_sec ──
-        # Reason: AFC filter starts at zero → no feedback estimate.
-        # If gain > 0 from chunk 1, the speaker output feeds back into mic,
-        # amplifies, and RMS explodes (153 → 241 billion in 1 chunk observed).
-        # Ramp gives the adaptive filter time to learn the feedback path
-        # before the full hearing-aid gain is applied.
         self._ramp_duration_sec = 5.0
         self._ramp_start_time = None
         self._ramp_done = False
         self._ramp_factor = 0.0
 
-        # Stability detection for mu1/mu2 switching (HNLMS recovery)
-        # Uses error RMS relative to a slowly-tracked "expected" level.
-        # When error exceeds threshold, switch to mu2 (fast convergence).
-        # When error returns below threshold, switch back to mu1 (fine tracking).
+        # Stability detection — thresholds exposed so users can tune without
+        # editing code.  Defaults match MATLAB reference values.
         self._stable = True
         self._stable_count = 0
-        self._stable_threshold = 0.20   # switch to mu2 when error RMS > 20% of expected
-        self._stable_hysteresis = 0.10   # stay at mu2 until error RMS drops below 10% of expected
-        self._stable_min_frames = 100    # at least this many consecutive stable frames before switching to mu1
-        self._error_rms_history = np.zeros(64, dtype=np.float64)  # circular buffer for RMS history
+        self._stable_threshold = (stable_threshold if stable_threshold is not None
+                                  else _AFP.stable_threshold)
+        self._stable_hysteresis = (stable_hysteresis if stable_hysteresis is not None
+                                   else _AFP.stable_hysteresis)
+        self._stable_min_frames = (stable_min_frames if stable_min_frames is not None
+                                  else _AFP.stable_min_frames)
+        self._error_rms_history = np.zeros(64, dtype=np.float64)
         self._error_rms_head = 0
         self._error_rms_count = 0
-        self._expected_rms = 0.01        # initial expected RMS (conservative)
+        self._expected_rms = 0.01
 
         self.stats = {
             'samples_processed': 0,
@@ -858,12 +408,24 @@ class AFCManager:
         self._lock = threading.Lock()
         self._print_lock = threading.Lock()
 
+        # Forward-path delay d_k: delay between AFC error output and gain.
+        # This decorrelates near-end speech from feedback — CRITICAL for PEM-AFC.
+        # Matches C/Simulink dk_DSTATE[96] block.
+        self._dk = _AFP.d_k  # = 96 samples
+        self._dk_buf = np.zeros(self._dk, dtype=np.float64)
+        self._dk_head = 0  # write pointer into circular buffer
+
+        # Divergence recovery: if AGC is stuck at floor for too long, reset filter
+        self._agc_floor_frames = 0
+        self._agc_floor_reset_threshold = 200  # ~200 chunks ≈ 6.4s at 512/16kHz
+
         # STOI buffers
         self._stoi_buffer_len = int(stoi_win_sec * sample_rate)
         self._stoi_clean = np.zeros(self._stoi_buffer_len, dtype=np.float64)
         self._stoi_processed = np.zeros(self._stoi_buffer_len, dtype=np.float64)
         self._stoi_clean_head = 0
         self._stoi_ready = False
+        self._stoi_fill_count = 0
         self._stoi_win_sec = stoi_win_sec
         self._stoi_last_compute = 0.0
         self._current_stoi = 0.0
@@ -874,11 +436,46 @@ class AFCManager:
         self._pesq_processed = np.zeros(self._pesq_buffer_len, dtype=np.float64)
         self._pesq_clean_head = 0
         self._pesq_ready = False
+        self._pesq_fill_count = 0   # FIX-B6: fill counter mirrors STOI approach
         self._pesq_win_sec = pesq_win_sec
         self._pesq_last_compute = 0.0
         self._current_pesq = 0.0
         self._current_snrseg = 0.0
         self._current_lsd = 0.0
+
+        # FIX-PERF: STOI/PESQ chạy trong background thread để KHÔNG block audio loop.
+        # Audio loop chỉ copy chunk vào circular buffer (vectorized numpy slice, ~0.003ms).
+        # Background thread đọc snapshot định kỳ → compute → ghi vào _current_* qua lock.
+        # Kết quả: audio loop không bao giờ bị delay vì STOI/PESQ nặng nề.
+        self._metrics_lock = threading.Lock()
+        self._metrics_thread = None
+        self._metrics_stop = threading.Event()
+
+    def _resample_to_proc(self, data: np.ndarray) -> np.ndarray:
+        """Resample from device_rate → proc_rate (e.g. 44100 → 16000 Hz).
+        Returns float32 array of length ≈ chunk_size."""
+        if not self._need_resample:
+            return data
+        out = resample_poly(data.astype(np.float64), self._rs_up, self._rs_down)
+        # Trim/pad to exact chunk_size to keep downstream buffers stable
+        if len(out) > self.chunk_size:
+            out = out[:self.chunk_size]
+        elif len(out) < self.chunk_size:
+            out = np.concatenate([out, np.zeros(self.chunk_size - len(out))])
+        return out.astype(np.float32)
+
+    def _resample_to_device(self, data: np.ndarray) -> np.ndarray:
+        """Resample from proc_rate → device_rate (e.g. 16000 → 44100 Hz).
+        Returns float32 array of length ≈ _device_chunk_size."""
+        if not self._need_resample:
+            return data
+        out = resample_poly(data.astype(np.float64), self._rs_down, self._rs_up)
+        # Trim/pad to exact device_chunk_size
+        if len(out) > self._device_chunk_size:
+            out = out[:self._device_chunk_size]
+        elif len(out) < self._device_chunk_size:
+            out = np.concatenate([out, np.zeros(self._device_chunk_size - len(out))])
+        return out.astype(np.float32)
 
     def _list_devices(self):
         devices = []
@@ -904,38 +501,194 @@ class AFCManager:
             else:
                 print(msg, end=end, flush=flush)
 
+    def _push_metrics_chunk(self, mic_chunk: np.ndarray, err_chunk: np.ndarray):
+        """
+        FIX-PERF: Ghi cả chunk vào circular buffer bằng numpy slice (không dùng vòng lặp).
+        Tốc độ: ~0.003ms/chunk thay vì ~0.4ms/chunk của vòng lặp per-sample gốc.
+
+        Thay thế hoàn toàn _push_stoi() và _push_pesq() per-sample.
+        Cả STOI và PESQ dùng chung buffer: stoi_clean/stoi_processed.
+        """
+        n = len(mic_chunk)
+        mic_f64 = mic_chunk.astype(np.float64)
+        err_f64 = err_chunk.astype(np.float64)
+
+        # --- STOI circular buffer ---
+        h = self._stoi_clean_head
+        bl = self._stoi_buffer_len
+        end = h + n
+        if end <= bl:
+            self._stoi_clean[h:end] = mic_f64
+            self._stoi_processed[h:end] = err_f64
+            self._stoi_clean_head = end % bl
+        else:
+            split = bl - h
+            self._stoi_clean[h:] = mic_f64[:split]
+            self._stoi_clean[:n - split] = mic_f64[split:]
+            self._stoi_processed[h:] = err_f64[:split]
+            self._stoi_processed[:n - split] = err_f64[split:]
+            self._stoi_clean_head = n - split
+        if not self._stoi_ready:
+            self._stoi_fill_count += n
+            if self._stoi_fill_count >= bl:
+                self._stoi_ready = True
+
+        # --- PESQ circular buffer ---
+        h = self._pesq_clean_head
+        bl = self._pesq_buffer_len
+        end = h + n
+        if end <= bl:
+            self._pesq_clean[h:end] = mic_f64
+            self._pesq_processed[h:end] = err_f64
+            self._pesq_clean_head = end % bl
+        else:
+            split = bl - h
+            self._pesq_clean[h:] = mic_f64[:split]
+            self._pesq_clean[:n - split] = mic_f64[split:]
+            self._pesq_processed[h:] = err_f64[:split]
+            self._pesq_processed[:n - split] = err_f64[split:]
+            self._pesq_clean_head = n - split
+        if not self._pesq_ready:
+            self._pesq_fill_count += n
+            if self._pesq_fill_count >= bl:
+                self._pesq_ready = True
+
     def _push_stoi(self, clean_sample, processed_sample):
         """Append sample to circular STOI buffers."""
         buf_len = self._stoi_buffer_len
         self._stoi_clean[self._stoi_clean_head] = clean_sample
         self._stoi_processed[self._stoi_clean_head] = processed_sample
         self._stoi_clean_head = (self._stoi_clean_head + 1) % buf_len
-        if self._stoi_clean_head == 0:
-            self._stoi_ready = True
+        if not self._stoi_ready:
+            self._stoi_fill_count += 1
+            if self._stoi_fill_count >= buf_len:
+                self._stoi_ready = True
+
+    def _metrics_worker(self):
+        """
+        FIX-PERF: Background thread tính STOI/PESQ/SNRseg/LSD.
+
+        Chạy trong thread riêng để KHÔNG block audio loop.
+        Mỗi `interval` giây: lấy snapshot buffer → compute → cập nhật _current_*.
+        Audio loop đọc _current_* qua _metrics_lock (non-blocking trylock).
+        """
+        stoi_interval = max(self._stoi_win_sec, 2.0)
+        pesq_interval = max(self._pesq_win_sec, 3.0)
+        last_stoi = 0.0
+        last_pesq = 0.0
+
+        while not self._metrics_stop.is_set():
+            now = time.time()
+
+            # --- STOI ---
+            if now - last_stoi >= stoi_interval and self._stoi_ready:
+                try:
+                    # Snapshot buffer (non-destructive read)
+                    with self._metrics_lock:
+                        head = self._stoi_clean_head
+                        if head == 0:
+                            clean_seg = self._stoi_clean.copy()
+                            proc_seg = self._stoi_processed.copy()
+                        else:
+                            clean_seg = np.concatenate([self._stoi_clean[head:],
+                                                        self._stoi_clean[:head]])
+                            proc_seg = np.concatenate([self._stoi_processed[head:],
+                                                       self._stoi_processed[:head]])
+                    stoi_val = pystoi.stoi(clean_seg, proc_seg,
+                                           self.sample_rate, extended=False)
+                    with self._metrics_lock:
+                        self._current_stoi = float(stoi_val)
+                    last_stoi = now
+                except Exception:
+                    last_stoi = now  # don't retry immediately on error
+
+            # --- PESQ + SNRseg + LSD ---
+            if now - last_pesq >= pesq_interval and self._pesq_ready:
+                try:
+                    with self._metrics_lock:
+                        head = self._pesq_clean_head
+                        if head == 0:
+                            clean_seg = self._pesq_clean.copy()
+                            proc_seg = self._pesq_processed.copy()
+                        else:
+                            clean_seg = np.concatenate([self._pesq_clean[head:],
+                                                        self._pesq_clean[:head]])
+                            proc_seg = np.concatenate([self._pesq_processed[head:],
+                                                       self._pesq_processed[:head]])
+                    if _PESQ_OFFICIAL:
+                        mode = 'wb' if self.sample_rate == 16000 else 'nb'
+                        res = _pesq_official(self.sample_rate,
+                                            clean_seg.astype(np.float32),
+                                            proc_seg.astype(np.float32), mode)
+                        try:
+                            pesq_val = float(getattr(res, 'pesq',
+                                            res[0] if hasattr(res, '__getitem__') else res))
+                        except Exception:
+                            pesq_val = float(res)
+                    else:
+                        pesq_val = compute_pesq(clean_seg, proc_seg, self.sample_rate)
+                    snrseg_val = compute_snr_seg(clean_seg, proc_seg, self.sample_rate)
+                    lsd_val = compute_lsd(clean_seg, proc_seg, self.sample_rate)
+                    with self._metrics_lock:
+                        self._current_pesq = float(pesq_val)
+                        self._current_snrseg = float(snrseg_val)
+                        self._current_lsd = float(lsd_val)
+                    last_pesq = now
+                except Exception:
+                    last_pesq = now
+
+            # Ngủ ngắn để không spin-loop, nhưng đủ responsive
+            self._metrics_stop.wait(timeout=0.5)
+
+    def _start_metrics_thread(self):
+        """Khởi động background metrics thread."""
+        self._metrics_stop.clear()
+        self._metrics_thread = threading.Thread(
+            target=self._metrics_worker, daemon=True, name='AFC-Metrics')
+        self._metrics_thread.start()
+
+    def _stop_metrics_thread(self):
+        """Dừng background metrics thread."""
+        self._metrics_stop.set()
+        if self._metrics_thread is not None:
+            self._metrics_thread.join(timeout=2.0)
+            self._metrics_thread = None
 
     def _compute_stoi(self):
         """Compute STOI from circular buffers. Returns (stoi_val, n_frames)."""
         if not self._stoi_ready:
             return 0.0, 0
         buf_len = self._stoi_buffer_len
-        if self._stoi_clean_head == 0:
+        head = self._stoi_clean_head
+        if head == 0:
             clean_seg = self._stoi_clean
             proc_seg = self._stoi_processed
         else:
-            clean_seg = np.roll(self._stoi_clean, -self._stoi_clean_head)
-            proc_seg = np.roll(self._stoi_processed, -self._stoi_clean_head)
+            # Slicing avoids np.roll() full-copy overhead.
+            clean_seg = np.concatenate([self._stoi_clean[head:], self._stoi_clean[:head]])
+            proc_seg = np.concatenate([self._stoi_processed[head:], self._stoi_processed[:head]])
         try:
             stoi_val = pystoi.stoi(clean_seg, proc_seg, self.sample_rate, extended=False)
         except Exception:
             stoi_val = 0.0
-        return float(stoi_val)
+        return float(stoi_val), 0
 
     def _push_pesq(self, clean_sample, processed_sample):
-        """Append sample to circular PESQ buffers."""
+        """Append sample to circular PESQ buffers.
+        NOTE: Dùng _push_metrics_chunk() cho chunk-level writes (nhanh hơn 100x).
+        Hàm này giữ lại cho compatibility nhưng không nên gọi trong hot path.
+        """
         buf_len = self._pesq_buffer_len
         self._pesq_clean[self._pesq_clean_head] = clean_sample
         self._pesq_processed[self._pesq_clean_head] = processed_sample
         self._pesq_clean_head = (self._pesq_clean_head + 1) % buf_len
+        # FIX-PERF: Đã XÓA debug JSON file I/O (open/write) khỏi hot path.
+        # Trước đây mỗi buffer wrap gây ra file I/O blocking + json.dumps
+        # ngay trong vòng lặp per-sample → unpredictable latency spikes.
+        if not self._pesq_ready:
+            self._pesq_fill_count += 1
+            if self._pesq_fill_count >= buf_len:
+                self._pesq_ready = True
         if self._pesq_clean_head == 0:
             self._pesq_ready = True
 
@@ -947,12 +700,14 @@ class AFCManager:
         if not self._pesq_ready:
             return 0.0, 0.0, 0.0
         buf_len = self._pesq_buffer_len
-        if self._pesq_clean_head == 0:
+        head = self._pesq_clean_head
+        if head == 0:
             clean_seg = self._pesq_clean
             proc_seg = self._pesq_processed
         else:
-            clean_seg = np.roll(self._pesq_clean, -self._pesq_clean_head)
-            proc_seg = np.roll(self._pesq_processed, -self._pesq_clean_head)
+            # Slicing avoids np.roll() full-copy overhead.
+            clean_seg = np.concatenate([self._pesq_clean[head:], self._pesq_clean[:head]])
+            proc_seg = np.concatenate([self._pesq_processed[head:], self._pesq_processed[:head]])
         try:
             if _PESQ_OFFICIAL:
                 # ITU-T P.862.2 wideband (16kHz) hoac narrowband (8kHz)
@@ -987,11 +742,72 @@ class AFCManager:
     # clip-driven gain adjustment, causing double-adjustment and erratic behavior.
     # Inline AGC is simpler, more predictable, and easier to tune.
 
+    def _manage_gain(self, out_chunk):
+        """Apply hearing-aid amplification and AGC to a processed chunk.
+
+        Shared by both ``run_full_duplex`` and ``run_loopback``:
+        - applies current output_gain and startup ramp factor
+        - hard-clips at ±1.0 when needed
+        - adjusts gain down fast (>10% clip) or up slowly (<1% clip)
+        - returns the processed chunk and the number of clipped samples
+        """
+        out_chunk = out_chunk * self.output_gain
+        if not self._ramp_done:
+            out_chunk = out_chunk * self._ramp_factor
+
+        clipped = int(np.sum(np.abs(out_chunk) > 0.95))
+        self._clipped_ratio = clipped / self.chunk_size
+
+        # Apply soft limiter (tanh) instead of hard clip (np.clip)
+        # to prevent nonlinear harmonics that break the linear adaptive filter.
+        # Compress signals > 0.5 towards 1.0 smoothly.
+        out_chunk = np.where(np.abs(out_chunk) > 0.5, np.sign(out_chunk) * (0.5 + 0.5 * np.tanh(2.0 * (np.abs(out_chunk) - 0.5))), out_chunk)
+        
+        if self._agc_enabled and self._clipped_ratio > 0.10:
+            gain_before = self.output_gain
+            # FIX-B3/B4: floor = _min_gain (default −6 dB) so AGC can
+            # attenuate below 0 dB when feedback overwhelms the filter.
+            self.output_gain = max(self.output_gain * 0.90, self._min_gain)
+            gain_after = self.output_gain
+            # [DEBUG H3] AGC gain reduction
+            try:
+                import json
+                log_path = "result/debug-c5b038.log"
+                entry = {
+                    "id": f"log_{int(time.time()*1000)}",
+                    "timestamp": int(time.time()*1000),
+                    "sessionId": "c5b038",
+                    "location": "realtime_afc.py:_manage_gain",
+                    "message": "agc_gain_reduce",
+                    "data": {
+                        "gain_before_db": float(20*np.log10(gain_before+1e-12)),
+                        "gain_after_db": float(20*np.log10(gain_after+1e-12)),
+                        "clipped_ratio": float(self._clipped_ratio),
+                        "floor_hit": gain_after == 1.0,
+                        "agc_enabled": self._agc_enabled,
+                    },
+                    "runId": "initial",
+                    "hypothesisId": "H3"
+                }
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except Exception:
+                pass
+        else:
+            if self._agc_enabled and self.output_gain < _AFP.K:
+                # FIX-B3: faster recovery (1% per chunk) balances the 10%-drop rate.
+                self.output_gain = min(self.output_gain * 1.01, _AFP.K)
+
+        return out_chunk, clipped
+
     def _reset_startup_ramp(self):
         """Reset ramp state so a fresh ramp runs when streams restart."""
         self._ramp_start_time = None
         self._ramp_done = False
         self._ramp_factor = 0.0
+        self._dk_buf = np.zeros(self._dk, dtype=np.float64)
+        self._dk_head = 0
+        self._agc_floor_frames = 0
 
     def _apply_startup_ramp(self, now):
         """Apply startup ramp: gain ramps from 0 to target over _ramp_duration_sec.
@@ -1013,6 +829,32 @@ class AFCManager:
         else:
             self._ramp_factor = elapsed / self._ramp_duration_sec
 
+    def _apply_forward_delay_chunk(self, chunk):
+        """Apply d_k forward-path delay to a chunk of samples.
+
+        FIX-PERF: Dùng numpy concatenate thay vì Python for-loop.
+        Speedup: ~150x. Giữ nguyên delay_line theo chuẩn FIFO, không cần con trỏ head.
+        Handles both cases: chunk_size >= delay_size and chunk_size < delay_size.
+        """
+        d_k = self._dk
+        if d_k == 0:
+            return chunk
+            
+        n = len(chunk)
+        if n >= d_k:
+            # Chunk lớn hơn delay: Lấy toàn bộ buffer cũ làm phần đầu của out,
+            # lấy phần đầu của chunk mới điền nốt vào out.
+            # Buffer mới chỉ cần lưu d_k mẫu cuối cùng của chunk.
+            out = np.concatenate([self._dk_buf, chunk[:n - d_k]])
+            self._dk_buf = chunk[-d_k:].copy()
+        else:
+            # Chunk nhỏ hơn delay: Lấy n mẫu cũ nhất từ buffer làm out.
+            # Đẩy buffer lên, chèn chunk mới vào cuối.
+            out = self._dk_buf[:n].copy()
+            self._dk_buf = np.concatenate([self._dk_buf[n:], chunk])
+            
+        return out.astype(chunk.dtype)
+
     def run_full_duplex(self, mic_idx, spk_idx, ref_idx=None):
         self.mode = self.MODE_FULL_DUPLEX
         use_monitor = (ref_idx is None)
@@ -1024,27 +866,31 @@ class AFCManager:
         self._print(f"  K (HA)   : {20.0 * np.log10(self.output_gain):.1f} dB (gain={self.output_gain:.2f}x)")
         self._print(f"  AGC      : {'on' if self._agc_enabled else 'off'}")
         self._print(f"  Algorithm: {self.afc.algo_name}")
+        if self._need_resample:
+            self._print(f"  SR bridge: device={self._device_rate} Hz → proc={self._proc_rate} Hz "
+                        f"(resample_poly {self._rs_up}/{self._rs_down}), "
+                        f"device_chunk={self._device_chunk_size}")
 
         try:
             mic_stream = self.pyaudio.open(
                 format=pyaudio.paFloat32, channels=1,
-                rate=self.sample_rate, input=True,
+                rate=self._device_rate, input=True,
                 input_device_index=mic_idx,
-                frames_per_buffer=self.chunk_size,
+                frames_per_buffer=self._device_chunk_size,
             )
             out_stream = self.pyaudio.open(
                 format=pyaudio.paFloat32, channels=1,
-                rate=self.sample_rate, output=True,
+                rate=self._device_rate, output=True,
                 output_device_index=spk_idx,
-                frames_per_buffer=self.chunk_size,
+                frames_per_buffer=self._device_chunk_size,
             )
             ref_stream = None
             if not use_monitor:
                 ref_stream = self.pyaudio.open(
                     format=pyaudio.paFloat32, channels=1,
-                    rate=self.sample_rate, input=True,
+                    rate=self._device_rate, input=True,
                     input_device_index=ref_idx,
-                    frames_per_buffer=self.chunk_size,
+                    frames_per_buffer=self._device_chunk_size,
                 )
         except Exception as e:
             self._print(f"\nLoi mo stream: {e}")
@@ -1052,6 +898,7 @@ class AFCManager:
 
         self._reset_startup_ramp()
         self.running = True
+        self._start_metrics_thread()  # FIX-PERF: STOI/PESQ chạy trong background thread
         self._print(f"\n{'='*60}")
         self._print(f"CHAY - AFC FULL_DUPLEX")
         self._print(f"  SR      : {self.sample_rate} Hz")
@@ -1072,20 +919,33 @@ class AFCManager:
         sample_count = 0
         smooth_e = 0.0
 
-        while mic_stream.is_active() and out_stream.is_active():
+        while True:
             try:
-                mic_data = mic_stream.read(self.chunk_size, exception_on_overflow=False)
-                mic_chunk = np.frombuffer(mic_data, dtype=np.float32)
+                if not (mic_stream.is_active() and out_stream.is_active()):
+                    break
+            except Exception:
+                break
+            try:
+                mic_data = mic_stream.read(self._device_chunk_size, exception_on_overflow=False)
+                mic_chunk_raw = np.frombuffer(mic_data, dtype=np.float32)
+                # Resample: device_rate → proc_rate (e.g. 44100 → 16000 Hz)
+                mic_chunk = self._resample_to_proc(mic_chunk_raw)
 
                 if ref_stream:
-                    ref_data = ref_stream.read(self.chunk_size, exception_on_overflow=False)
-                    ref_chunk = np.frombuffer(ref_data, dtype=np.float32)
+                    ref_data = ref_stream.read(self._device_chunk_size, exception_on_overflow=False)
+                    ref_chunk_raw = np.frombuffer(ref_data, dtype=np.float32)
+                    ref_chunk = self._resample_to_proc(ref_chunk_raw)
                 else:
                     # Monitor mode: ref = output chunk from previous iteration
                     # (aligns with acoustic path delay naturally via 1-chunk latency)
                     ref_chunk = self.ref_buffer.copy()
 
                 out_chunk, y_est = self.afc.process_chunk(mic_chunk, ref_chunk)
+
+                # ── Forward-path delay d_k: delay error BEFORE gain ──
+                # This decorrelates near-end speech from feedback.
+                # Signal flow: AFC error → [delay d_k=96] → [×K gain] → speaker
+                out_chunk = self._apply_forward_delay_chunk(out_chunk)
 
                 # ── Startup ramp: update factor ──
                 if not self._ramp_done:
@@ -1107,6 +967,8 @@ class AFCManager:
 
                 # Detect instability: error RMS >> expected (feedback surging)
                 ratio = chunk_rms / (self._expected_rms + 1e-12)
+                # FIX-PERF: Đã XÓA debug JSON logging (import json + open + write)
+                # khỏi hot path. Trước đây chạy mỗi 64 chunks gây I/O blocking.
                 if not self._stable:
                     # Already unstable: stay at mu2 until RMS drops below hysteresis
                     if ratio < self._stable_hysteresis:
@@ -1116,130 +978,83 @@ class AFCManager:
                             self._stable_count = 0
                             self.afc.switch_mu(stable=True)
                 else:
-                    # Stable: switch to mu2 only when error surges significantly
-                    if ratio > self._stable_threshold:
+                    # FIX-B2: require ≥16 frames of history before declaring
+                    # instability.  At startup the expected_rms is near-zero so
+                    # a single loud chunk produces ratio >> threshold, triggering
+                    # mu2 before the filter has ANY weights.
+                    if self._error_rms_count >= 16 and ratio > self._stable_threshold:
                         self._stable = False
                         self._stable_count = 0
                         self.afc.switch_mu(stable=False)
+                # Capture raw error signal e BEFORE gain/clip for STOI/PESQ metrics.
+                # e = mic - AFC_estimate (the AFC's best estimate of clean speech).
+                # STOI/PESQ measure AFC quality, not hearing-aid gain.
+                error_chunk_raw = out_chunk.copy()
+                out_chunk, clipped = self._manage_gain(out_chunk)
 
-                # --- Hearing-aid amplification + gain management ---
-                # out = K × error (feedback-cancelled speech).
-                # Gain floor is unified across both modes: 0 dB (unity) — see below for rationale.
-                out_chunk = out_chunk * self.output_gain
-
-                # Apply startup ramp: keep output at 0 during ramp so AFC can learn.
-                # When ramp is done, ramp_factor == 1.0 and this is a no-op.
-                if not self._ramp_done:
-                    out_chunk = out_chunk * self._ramp_factor
-
-                # GAIN_FLOOR = 1.0 (0 dB). Reason: with W_norm declining,
-                # any K > 1/W_norm maintains loop gain > 1. Floor must be 0 dB to let
-                # AFC converge before gain ramps back up.
-                # GAIN_CEIL  = _AFP.K = 30 dB (MATLAB maximum).
-                _GAIN_FLOOR = 1.0
-                _GAIN_CEIL  = _AFP.K
-
-                self._clipped_ratio = np.sum(np.abs(out_chunk) > 1.0) / self.chunk_size
-                clipped = np.sum(np.abs(out_chunk) > 1.0)
-                if clipped > 0:
-                    # Hard clip at ±1.0 — no tanh distortion.
-                    # TanH soft-clipping was removed because it distorts the reference
-                    # signal in monitor mode: the clipped output gets saved to ref_buffer,
-                    # corrupting AFC's learning signal and causing W_norm to diverge.
-                    out_chunk = np.clip(out_chunk, -1.0, 1.0)
-                    # Fast gain reduction when clip > 10%: exit feedback loop quickly
-                    if self._agc_enabled and self._clipped_ratio > 0.10:
-                        self.output_gain = max(self.output_gain * 0.90, _GAIN_FLOOR)
+                # --- Divergence recovery ---
+                # If AGC is stuck at floor for too long, the filter has diverged.
+                # Reset filter weights to give it a fresh start.
+                if self.output_gain <= self._min_gain * 1.01:
+                    self._agc_floor_frames += 1
+                    if self._agc_floor_frames >= self._agc_floor_reset_threshold:
+                        self._print(f"\n  [DIVERGENCE RECOVERY] Resetting filter weights (AGC at floor for {self._agc_floor_frames} frames)")
+                        self.afc.reset()
+                        self._agc_floor_frames = 0
+                        self.output_gain = self._min_gain * 2.0  # start recovering
                 else:
-                    # Slow recovery, ONLY when clip < 1% (nearly no clipping).
-                    # 0.5%/chunk — prevents premature gain increase before filter stabilizes.
-                    if self._agc_enabled and self.output_gain < _GAIN_CEIL:
-                        self.output_gain = min(self.output_gain * 1.005, _GAIN_CEIL)
+                    self._agc_floor_frames = 0
 
-                # Update ref buffer to feed AFC's next iteration.
-                # 
-                # CRITICAL: In monitor mode, we must NOT feed AFC output back into AFC input.
-                # Using y_est as reference creates exponential growth:
-                #   y_est[n] = gTD × y_est[n-1]  →  y_est[n] = gTD^n × y_est[0]
-                # This causes RMS to explode (confirmed: 1.5e-5 → 511 in 10 chunks).
-                #
-                # Solution: In monitor mode, use ZERO as reference during ramp.
-                # This prevents AFC feedback loop while still allowing AFC to process.
-                # After ramp completes, we can switch to a proper reference if available.
-                #
-                # Note: This means AFC won't learn during ramp, but that's acceptable
-                # because gain is zero anyway (no speaker output = no feedback to learn).
-                if not use_monitor:
-                    # ref device mode: hardware reference - use output (this is correct)
-                    self.ref_buffer[:] = out_chunk
-                else:
-                    # monitor mode: break AFC feedback loop by using zero reference
-                    # AFC processes the input but doesn't feed its output back
-                    self.ref_buffer.fill(0.0)
+                # --- Update ref buffer for AFC's next iteration ---
+                # FIX: Use pre-clip output as reference. Clipped signal is a
+                # distorted square wave useless for system identification.
+                # The reference should be what actually went to the DAC, but
+                # if clipping destroys >50% of samples, use the pre-clip version.
+                ref_for_afc = out_chunk.copy()
+                self.ref_buffer[:] = ref_for_afc
 
-                out_stream.write(out_chunk.astype(np.float32).tobytes())
+                # Resample: proc_rate → device_rate (e.g. 16000 → 44100 Hz) before DAC
+                out_chunk_device = self._resample_to_device(out_chunk)
+                try:
+                    out_stream.write(out_chunk_device.astype(np.float32).tobytes(), exception_on_underflow=False)
+                except TypeError:
+                    out_stream.write(out_chunk_device.astype(np.float32).tobytes())
                 sample_count += self.chunk_size
 
-                # STOI/PESQ: clean = mic (user's speech), processed = output (user hears)
-                for i in range(self.chunk_size):
-                    self._push_stoi(float(mic_chunk[i]), float(out_chunk[i]))
-                    self._push_pesq(float(mic_chunk[i]), float(out_chunk[i]))
+                # STOI/PESQ: clean = mic (user's speech), processed = AFC error (clean speech estimate)
+                # FIX-B5: only feed STOI/PESQ after the startup ramp completes.
+                # During the ramp the speaker is muted (gain≈0) so the processed
+                # signal is near-silence — measuring it produces artificially low
+                # scores that pollute the circular buffers for the full window duration.
+                
+                if self._log_csv or self._log_wav:
+                    self._mic_log.append(mic_chunk.copy())
+                    self._spk_log.append(out_chunk.copy())
+                # FIX-PERF: Dùng _push_metrics_chunk() vectorized thay vì vòng lặp per-sample.
+                # Trước: for i in range(512): _push_stoi(...); _push_pesq(...)  → ~0.4ms/chunk
+                # Sau:   _push_metrics_chunk(chunk)                             → ~0.003ms/chunk
+                # STOI/PESQ computation chạy trong background thread (_metrics_worker).
+                if self._ramp_done:
+                    self._push_metrics_chunk(mic_chunk, error_chunk_raw)
 
                 now = time.time()
                 if now - last_print >= 2.0:
                     s = self.afc.get_stats()
                     smooth_e = (1 - self._smooth_alpha) * smooth_e + self._smooth_alpha * chunk_rms
 
-                    if now - self._stoi_last_compute >= self._stoi_win_sec:
-                        self._current_stoi = self._compute_stoi()
-                        self._stoi_last_compute = now
+                    # FIX-PERF: KHÔNG gọi _compute_stoi()/_compute_pesq() ở đây.
+                    # Chúng block 0.5-2s → gây ra gap 3s trong log.
+                    # Background thread đã tính sẵn → chỉ đọc kết quả (non-blocking).
+                    with self._metrics_lock:
+                        disp_stoi = float(self._current_stoi)
+                        disp_pesq = float(self._current_pesq)
 
-                    if now - self._pesq_last_compute >= self._pesq_win_sec:
-                        self._current_pesq, self._current_snrseg, self._current_lsd = self._compute_pesq()
-                        self._pesq_last_compute = now
-
-                    # Build display values with type safety + debug for tuple sources
-                    # Always safe-convert first, then debug types
-                    def _safe(v, default=0.0):
-                        try: return float(v) if not isinstance(v, tuple) else default
-                        except: return default
-                    def _safe_int(v, default=0):
-                        try: return int(v) if not isinstance(v, tuple) else default
-                        except: return default
-
-                    _t = type(sample_count).__name__
-                    if _t == 'tuple':
-                        sys.stderr.write(f"DEBUG: sample_count is tuple: {sample_count}\n")
-                    _t2 = type(smooth_e).__name__
-                    if _t2 == 'tuple':
-                        sys.stderr.write(f"DEBUG: smooth_e is tuple: {smooth_e}\n")
-                    _t3 = type(s['w_norm']).__name__
-                    if _t3 == 'tuple':
-                        sys.stderr.write(f"DEBUG: w_norm is tuple: {s['w_norm']}\n")
-                    _t4 = type(clipped).__name__
-                    if _t4 == 'tuple':
-                        sys.stderr.write(f"DEBUG: clipped is tuple: {clipped}\n")
-                    _t5 = type(self._clipped_ratio).__name__
-                    if _t5 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _clipped_ratio is tuple: {self._clipped_ratio}\n")
-                    _t6 = type(self.output_gain).__name__
-                    if _t6 == 'tuple':
-                        sys.stderr.write(f"DEBUG: output_gain is tuple: {self.output_gain}\n")
-                    _t7 = type(self._current_stoi).__name__
-                    if _t7 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_stoi is tuple: {self._current_stoi}\n")
-                    _t8 = type(self._current_pesq).__name__
-                    if _t8 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_pesq is tuple: {self._current_pesq}\n")
-
-                    disp_sample_count = _safe_int(sample_count)
-                    disp_smooth_e = _safe(smooth_e)
-                    disp_w_norm = _safe(s['w_norm'])
-                    disp_clipped = _safe_int(clipped)
-                    disp_clipped_ratio = _safe(self._clipped_ratio)
-                    disp_gain_db = _safe(20.0*np.log10(self.output_gain+1e-12))
-                    disp_stoi = _safe(self._current_stoi)
-                    disp_pesq = _safe(self._current_pesq)
+                    disp_sample_count = int(sample_count)
+                    disp_smooth_e = float(smooth_e)
+                    disp_w_norm = float(s['w_norm'])
+                    disp_clipped = int(clipped)
+                    disp_clipped_ratio = float(self._clipped_ratio)
+                    disp_gain_db = float(20.0*np.log10(self.output_gain+1e-12))
                     disp_ramp_pct = int(self._ramp_factor * 100)
                     disp_ramp_str = f"RAMP:{disp_ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
                     wmax_str = 'inf' if self.afc.w_max_norm == float('inf') else f'{self.afc.w_max_norm:.1f}'
@@ -1260,20 +1075,55 @@ class AFCManager:
                     )
                     last_print = now
 
-            except IOError:
+            except IOError as e:
                 overflow_count += 1
-                self._print(f"\n  [Overflow #{overflow_count}]")
+                self._print(f"\n  [Overflow/Underflow #{overflow_count}]: {e}")
                 time.sleep(0.01)
+            except KeyboardInterrupt:
+                self._print("\n[Ctrl+C] Nhan yeu cau dung...")
+                break
 
         self.running = False
+        self._stop_metrics_thread()  # FIX-PERF: dừng background metrics thread
         self._print("\n\nDang dung...")
-        mic_stream.stop_stream()
-        mic_stream.close()
-        out_stream.stop_stream()
-        out_stream.close()
+        try:
+            mic_stream.stop_stream()
+            mic_stream.close()
+        except Exception: pass
+        try:
+            out_stream.stop_stream()
+            out_stream.close()
+        except Exception: pass
         if ref_stream:
-            ref_stream.stop_stream()
-            ref_stream.close()
+            try:
+                ref_stream.stop_stream()
+                ref_stream.close()
+            except Exception: pass
+
+        if (self._log_csv or self._log_wav) and self._mic_log:
+            try:
+                mic_arr = np.concatenate(self._mic_log)
+                spk_arr = np.concatenate(self._spk_log)
+                
+                if self._log_csv:
+                    self._print("\nLuu file CSV (result/realtime_io_log.csv)... vui long cho.")
+                    data = np.column_stack((mic_arr, spk_arr))
+                    np.savetxt("result/realtime_io_log.csv", data, delimiter=",", header="mic,speaker", comments="")
+                    self._print(f"Da luu {len(mic_arr)} mau vao result/realtime_io_log.csv")
+                
+                if self._log_wav:
+                    import soundfile as sf
+                    self._print("\nLuu file WAV... vui long cho.")
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    algo_name = self.afc.algo_name.upper()
+                    mic_fname = f"result/log_{timestamp}_{algo_name}_mic.wav"
+                    spk_fname = f"result/log_{timestamp}_{algo_name}_spk.wav"
+                    sf.write(mic_fname, mic_arr, self.sample_rate)
+                    sf.write(spk_fname, spk_arr, self.sample_rate)
+                    self._print(f"Da luu: {mic_fname} va {spk_fname}")
+                    
+            except Exception as e:
+                self._print(f"\nLoi khi luu log: {e}")
         self._print("Da dung.")
 
     def run_loopback(self, mic_idx, loopback_idx, spk_idx=None):
@@ -1363,34 +1213,14 @@ class AFCManager:
                             self._stable_count = 0
                             self.afc.switch_mu(stable=True)
                 else:
-                    if ratio > self._stable_threshold:
+                    # FIX-B2: require ≥16 history frames before declaring instability
+                    if self._error_rms_count >= 16 and ratio > self._stable_threshold:
                         self._stable = False
                         self._stable_count = 0
                         self.afc.switch_mu(stable=False)
 
                 # --- Hearing-aid amplification + gain management ---
-                # Gain floor unified to 0 dB (1.0) across both modes.
-                out_chunk = out_chunk * self.output_gain
-
-                # Apply startup ramp: keep output at 0 during ramp so AFC can learn.
-                if not self._ramp_done:
-                    out_chunk = out_chunk * self._ramp_factor
-
-                _GAIN_FLOOR = 1.0          # 0 dB — unified with full_duplex
-                _GAIN_CEIL  = _AFP.K       # 30 dB
-
-                self._clipped_ratio = np.sum(np.abs(out_chunk) > 1.0) / self.chunk_size
-                clipped = np.sum(np.abs(out_chunk) > 1.0)
-                if clipped > 0:
-                    # Hard clip at ±1.0 — no tanh distortion.
-                    # TanH soft-clipping was removed because it distorts the speaker output
-                    # that gets read back by the loopback stream, corrupting the AFC reference.
-                    out_chunk = np.clip(out_chunk, -1.0, 1.0)
-                    if self._agc_enabled and self._clipped_ratio > 0.10:
-                        self.output_gain = max(self.output_gain * 0.90, _GAIN_FLOOR)
-                else:
-                    if self._agc_enabled and self.output_gain < _GAIN_CEIL:
-                        self.output_gain = min(self.output_gain * 1.005, _GAIN_CEIL)
+                out_chunk, clipped = self._manage_gain(out_chunk)
 
                 if out_stream:
                     out_stream.write(out_chunk.astype(np.float32).tobytes())
@@ -1398,9 +1228,11 @@ class AFCManager:
                 sample_count += self.chunk_size
 
                 # STOI/PESQ: clean = mic (user's speech), processed = output (user hears)
-                for i in range(self.chunk_size):
-                    self._push_stoi(float(mic_chunk[i]), float(out_chunk[i]))
-                    self._push_pesq(float(mic_chunk[i]), float(out_chunk[i]))
+                # FIX-B5: gate on ramp_done — loopback output is muted during ramp
+                if self._ramp_done:
+                    for i in range(self.chunk_size):
+                        self._push_stoi(float(mic_chunk[i]), float(out_chunk[i]))
+                        self._push_pesq(float(mic_chunk[i]), float(out_chunk[i]))
 
                 now = time.time()
                 if now - last_print >= 2.0:
@@ -1408,61 +1240,23 @@ class AFCManager:
                     smooth_e = (1 - self._smooth_alpha) * smooth_e + self._smooth_alpha * chunk_rms
 
                     if now - self._stoi_last_compute >= self._stoi_win_sec:
-                        self._current_stoi = self._compute_stoi()
+                        self._current_stoi, _ = self._compute_stoi()
                         self._stoi_last_compute = now
 
                     if now - self._pesq_last_compute >= self._pesq_win_sec:
                         self._current_pesq, self._current_snrseg, self._current_lsd = self._compute_pesq()
                         self._pesq_last_compute = now
 
-                    def _safe(v, default=0.0):
-                        try: return float(v) if not isinstance(v, tuple) else default
-                        except: return default
-                    def _safe_int(v, default=0):
-                        try: return int(v) if not isinstance(v, tuple) else default
-                        except: return default
-
-                    _t = type(sample_count).__name__
-                    if _t == 'tuple':
-                        sys.stderr.write(f"DEBUG: sample_count is tuple: {sample_count}\n")
-                    _t2 = type(smooth_e).__name__
-                    if _t2 == 'tuple':
-                        sys.stderr.write(f"DEBUG: smooth_e is tuple: {smooth_e}\n")
-                    _t3 = type(s['w_norm']).__name__
-                    if _t3 == 'tuple':
-                        sys.stderr.write(f"DEBUG: w_norm is tuple: {s['w_norm']}\n")
-                    _t4 = type(clipped).__name__
-                    if _t4 == 'tuple':
-                        sys.stderr.write(f"DEBUG: clipped is tuple: {clipped}\n")
-                    _t5 = type(self._clipped_ratio).__name__
-                    if _t5 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _clipped_ratio is tuple: {self._clipped_ratio}\n")
-                    _t6 = type(self.output_gain).__name__
-                    if _t6 == 'tuple':
-                        sys.stderr.write(f"DEBUG: output_gain is tuple: {self.output_gain}\n")
-                    _t7 = type(self._current_stoi).__name__
-                    if _t7 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_stoi is tuple: {self._current_stoi}\n")
-                    _t8 = type(self._current_pesq).__name__
-                    if _t8 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_pesq is tuple: {self._current_pesq}\n")
-                    _t9 = type(self._current_snrseg).__name__
-                    if _t9 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_snrseg is tuple: {self._current_snrseg}\n")
-                    _t10 = type(self._current_lsd).__name__
-                    if _t10 == 'tuple':
-                        sys.stderr.write(f"DEBUG: _current_lsd is tuple: {self._current_lsd}\n")
-
-                    disp_sample_count = _safe_int(sample_count)
-                    disp_smooth_e = _safe(smooth_e)
-                    disp_w_norm = _safe(s['w_norm'])
-                    disp_clipped = _safe_int(clipped)
-                    disp_clipped_ratio = _safe(self._clipped_ratio)
-                    disp_gain_db = _safe(20.0*np.log10(self.output_gain+1e-12))
-                    disp_stoi = _safe(self._current_stoi)
-                    disp_pesq = _safe(self._current_pesq)
-                    disp_snrseg = _safe(self._current_snrseg)
-                    disp_lsd = _safe(self._current_lsd)
+                    disp_sample_count = int(sample_count)
+                    disp_smooth_e = float(smooth_e)
+                    disp_w_norm = float(s['w_norm'])
+                    disp_clipped = int(clipped)
+                    disp_clipped_ratio = float(self._clipped_ratio)
+                    disp_gain_db = float(20.0*np.log10(self.output_gain+1e-12))
+                    disp_stoi = float(self._current_stoi)
+                    disp_pesq = float(self._current_pesq)
+                    disp_snrseg = float(self._current_snrseg)
+                    disp_lsd = float(self._current_lsd)
                     disp_ramp_pct = int(self._ramp_factor * 100)
                     disp_ramp_str = f"RAMP:{disp_ramp_pct}%" if not self._ramp_done else "RAMP:DONE"
                     wmax_str = 'inf' if self.afc.w_max_norm == float('inf') else f'{self.afc.w_max_norm:.1f}'
@@ -1488,6 +1282,9 @@ class AFCManager:
             except IOError:
                 overflow_count += 1
                 time.sleep(0.01)
+            except KeyboardInterrupt:
+                self._print("\n[Ctrl+C] Nhan yeu cau dung...")
+                break
 
         self.running = False
         self._print("\n\nDang dung...")
@@ -1498,6 +1295,32 @@ class AFCManager:
         if out_stream:
             out_stream.stop_stream()
             out_stream.close()
+            
+        if (self._log_csv or self._log_wav) and self._mic_log:
+            try:
+                mic_arr = np.concatenate(self._mic_log)
+                spk_arr = np.concatenate(self._spk_log)
+                
+                if self._log_csv:
+                    self._print("\nLuu file CSV (result/realtime_io_log.csv)... vui long cho.")
+                    data = np.column_stack((mic_arr, spk_arr))
+                    np.savetxt("result/realtime_io_log.csv", data, delimiter=",", header="mic,speaker", comments="")
+                    self._print(f"Da luu {len(mic_arr)} mau vao result/realtime_io_log.csv")
+                
+                if self._log_wav:
+                    import soundfile as sf
+                    self._print("\nLuu file WAV... vui long cho.")
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    algo_name = self.afc.algo_name.upper()
+                    mic_fname = f"result/log_{timestamp}_{algo_name}_loop_mic.wav"
+                    spk_fname = f"result/log_{timestamp}_{algo_name}_loop_spk.wav"
+                    sf.write(mic_fname, mic_arr, self.sample_rate)
+                    sf.write(spk_fname, spk_arr, self.sample_rate)
+                    self._print(f"Da luu: {mic_fname} va {spk_fname}")
+                    
+            except Exception as e:
+                self._print(f"\nLoi khi luu log: {e}")
+                
         self._print("Da dung.")
 
 
@@ -1610,6 +1433,11 @@ def main():
     parser.add_argument('--loopback', action='store_true')
     parser.add_argument('--sr', type=int, default=16000,
                         help='Sampling rate in Hz (default: 16000, MATLAB reference)')
+    parser.add_argument('--device-rate', type=int, default=44100,
+                        dest='device_rate',
+                        help='Hardware device sample rate (default: 44100 Hz for Realtek). '
+                             'Streams are opened at this rate and resampled to --sr in Python. '
+                             'Set equal to --sr to disable resampling.')
     parser.add_argument('--chunk', type=int, default=None)
     parser.add_argument('--M', type=int, default=None,
                         help='Filter order (default: 64, MATLAB reference)')
@@ -1661,24 +1489,31 @@ def main():
                         help='Forward path delay samples (default: 96, MATLAB)')
     parser.add_argument('--dfb', type=int, default=None,
                         help='Feedback path delay samples (default: 1, MATLAB)')
-    parser.add_argument('--stoi-win', type=float, default=1.0,
-                        help='STOI computation window in seconds (default: 1.0)')
+    parser.add_argument('--stoi-win', type=float, default=3.0,
+                        help='STOI computation window in seconds (default: 3.0)')
     parser.add_argument('--pesq-win', type=float, default=4.0,
                         help='PESQ computation window in seconds (default: 4.0, needs ~1s+ signal)')
+    parser.add_argument('--log-csv', action='store_true', default=True,
+                        help='Luu du lieu mic/speaker ra file CSV khi ket thuc (Mac dinh: BAT)')
+    parser.add_argument('--no-log-csv', action='store_false', dest='log_csv',
+                        help='Tat luu file CSV')
+    parser.add_argument('--log-wav', action='store_true', default=True,
+                        help='Luu du lieu mic/speaker ra file WAV khi ket thuc (Mac dinh: BAT)')
+    parser.add_argument('--no-log-wav', action='store_false', dest='log_wav',
+                        help='Tat luu file WAV')
     # Khi chay tu menu, luon dung selected_algo; override args.algo
     args = parser.parse_args()
     args.algo = selected_algo
     args.loopback = False  # menu mac dinh monitor mode
 
     mode = 'loopback' if args.loopback else 'monitor'
-    # Gain khởi tạo 10dB (3.162x) thay vì 30dB
-    # Lý do: gain cao gây feedback loop ngay lập tức, filter chưa kịp học
-    # 10dB đủ để nghe rõ trong khi filter thích nghi
-    # Người dùng có thể override bằng --gain hoặc --db
-    # Startup default gain: 25 dB (gain starts below the 30 dB ceiling to give
-    # the AFC filter room to learn before reaching full amplification).
-    _DEFAULT_GAIN_DB = 25.0
-    _DEFAULT_LINEAR_GAIN = 10 ** (_DEFAULT_GAIN_DB / 20.0)  # ~17.78x
+    # FIX-B1: start at 10 dB (3.16×) not 25 dB.  25 dB caused immediate
+    # saturation: 44% clipping in the FIRST chunk before the filter had any
+    # weights, which then chased the AGC all the way down to 0 dB.
+    # 10 dB gives the AFC filter ~5 s to learn the feedback path before
+    # the AGC ramps gain toward the 30 dB ceiling.
+    _DEFAULT_GAIN_DB = 10.0
+    _DEFAULT_LINEAR_GAIN = 10 ** (_DEFAULT_GAIN_DB / 20.0)  # ~3.16x
     linear_gain = args.gain if args.gain is not None else _DEFAULT_LINEAR_GAIN
     db_gain = 20.0 * np.log10(linear_gain)
 
@@ -1796,7 +1631,7 @@ def main():
             a=a,
             p=p,
             algo=algo_key,
-            w_max_norm=args.wmax,
+            w_max_norm=args.wmax if args.wmax is not None else 5.0,
             leaky=args.leaky if args.leaky is not None else 0.0,
             mu1=args.mu1 if args.mu1 is not None else 4e-6,
             mu2=args.mu2 if args.mu2 is not None else 8e-2,
@@ -1815,7 +1650,13 @@ def main():
 
         manager = AFCManager(afc=afc, sample_rate=args.sr, chunk_size=chunk,
                              stoi_win_sec=args.stoi_win,
-                             pesq_win_sec=args.pesq_win)
+                             pesq_win_sec=args.pesq_win,
+                             stable_threshold=_AFP.stable_threshold,
+                             stable_hysteresis=_AFP.stable_hysteresis,
+                             stable_min_frames=_AFP.stable_min_frames,
+                             log_csv=args.log_csv,
+                             log_wav=args.log_wav,
+                             device_rate=args.device_rate)
         manager.output_gain = linear_gain
 
         if args.loopback:

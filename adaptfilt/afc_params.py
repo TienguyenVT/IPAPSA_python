@@ -36,7 +36,7 @@ class AFCParameters:
     K = 31.62             # -     - Linear gain = 10^(Kdb/20)
     d_k = 96              # samples - Forward-path delay
     d_fb = 1              # samples - Feedback-cancellation path delay
-    Lg_hat = 64           # samples - Adaptive filter length
+    Lg_hat = 64           # samples - Adaptive filter length (matches C: AF.N=64)
     La = 20               # samples - AR model filter length (pre-whitening)
     Nfreq = 512           # samples - FFT points for MIS/MSG/ASG analysis
     framelength = 160     # samples - Frame length for AR estimation (10 ms at 16 kHz)
@@ -58,22 +58,34 @@ class AFCParameters:
     # ======================================================================
     # === Algorithm Parameters (Table II in MATLAB reference)
     # ======================================================================
-    # mu1: NLMS step when system is stable (sw2 mode) = mu/2
-    mu1 = 4e-6
-    # mu2: NLMS step when system is unstable = mu*10^4  (for HNLMS recovery)
-    mu2 = 8e-2
+    # mu1: step when system is stable (HNLMS recovery sw2 mode)
+    # C/Simulink: PEM_AFC_2019a_DW.AF.mu1 = 0.005 (line 3750 of PEM_AFC_2019a.c)
+    mu1 = 0.005
+    # mu2: step when system is unstable (HNLMS recovery)
+    # C/Simulink: PEM_AFC_2019a_DW.AF.mu2 = 0.001 (line 3751 of PEM_AFC_2019a.c)
+    mu2 = 0.001
     # delta: regularization parameter (prevents division by zero)
     delta = 1e-6
     # lda: sigmoid coefficient in signed-error term
     lda = 6
     # delta_sc: regularization for sparseness measure
     delta_sc = 1e-8
-    # eps_R: epsilon in regression matrix R_mu = eps*I
-    eps_R = 1e-5
+    # eps: epsilon in regression matrix R_mu = eps*I
+    eps = 1e-5
     # beta: threshold factor for tanh-gated signal (threshold = beta/1000 = 0.05)
     beta = 50
     # alpha_a: proportionate algorithm control (aa=0 -> IPAPSA, aa=-1 -> APSA, aa=1 -> PAPSA)
     alpha_a = 0.5
+
+    # Stability detection thresholds for HNLMS recovery
+    # FIX: ratio = chunk_rms / expected_rms ≈ 1.0 during normal speech.
+    # Old values (0.20, 0.10) caused PERMANENT mu2 mode because ratio > 0.20
+    # is always true (ratio is ~1.0, never ~0.0).
+    # Correct interpretation: declare instability only when chunk is N× louder
+    # than the rolling median, which indicates a real feedback burst.
+    stable_threshold = 5.0   # switch to mu2 when RMS spike > 5× expected (real burst)
+    stable_hysteresis = 2.0  # return to stable when RMS < 2× expected (back to normal)
+    stable_min_frames = 20   # fewer frames needed to confirm recovery (was 100)
 
     # ======================================================================
     # === Error Clipping / TanH Gating (Table V in MATLAB reference)
